@@ -83,18 +83,41 @@ func (sg smGroup) nonLeader() stateMachine {
 	return nil
 }
 
+// Take out the lock on all nodes.
+func (sg smGroup) lockAll() {
+	for _, sm := range sg {
+		sm.node().(*raft).Lock()
+	}
+}
+
+// Release the lock on all nodes.
+func (sg smGroup) unlockAll() {
+	for _, sm := range sg {
+		sm.node().(*raft).Unlock()
+	}
+}
+
 // Create a raft group and place on numMembers servers at random.
+// Filestore based.
 func (c *cluster) createRaftGroup(name string, numMembers int, smf smFactory) smGroup {
+	return c.createRaftGroupEx(name, numMembers, smf, FileStorage)
+}
+
+func (c *cluster) createMemRaftGroup(name string, numMembers int, smf smFactory) smGroup {
+	return c.createRaftGroupEx(name, numMembers, smf, MemoryStorage)
+}
+
+func (c *cluster) createRaftGroupEx(name string, numMembers int, smf smFactory, st StorageType) smGroup {
 	c.t.Helper()
 	if numMembers > len(c.servers) {
 		c.t.Fatalf("Members > Peers: %d vs  %d", numMembers, len(c.servers))
 	}
 	servers := append([]*Server{}, c.servers...)
 	rand.Shuffle(len(servers), func(i, j int) { servers[i], servers[j] = servers[j], servers[i] })
-	return c.createRaftGroupWithPeers(name, servers[:numMembers], smf)
+	return c.createRaftGroupWithPeers(name, servers[:numMembers], smf, st)
 }
 
-func (c *cluster) createRaftGroupWithPeers(name string, servers []*Server, smf smFactory) smGroup {
+func (c *cluster) createRaftGroupWithPeers(name string, servers []*Server, smf smFactory, st StorageType) smGroup {
 	c.t.Helper()
 
 	var sg smGroup
@@ -108,14 +131,21 @@ func (c *cluster) createRaftGroupWithPeers(name string, servers []*Server, smf s
 	}
 
 	for _, s := range servers {
-		fs, err := newFileStore(
-			FileStoreConfig{StoreDir: c.t.TempDir(), BlockSize: defaultMediumBlockSize, AsyncFlush: false, SyncInterval: 5 * time.Minute},
-			StreamConfig{Name: name, Storage: FileStorage},
-		)
-		require_NoError(c.t, err)
-		cfg := &RaftConfig{Name: name, Store: c.t.TempDir(), Log: fs}
+		var cfg *RaftConfig
+		if st == FileStorage {
+			fs, err := newFileStore(
+				FileStoreConfig{StoreDir: c.t.TempDir(), BlockSize: defaultMediumBlockSize, AsyncFlush: false, SyncInterval: 5 * time.Minute},
+				StreamConfig{Name: name, Storage: FileStorage},
+			)
+			require_NoError(c.t, err)
+			cfg = &RaftConfig{Name: name, Store: c.t.TempDir(), Log: fs}
+		} else {
+			ms, err := newMemStore(&StreamConfig{Name: name, Storage: MemoryStorage})
+			require_NoError(c.t, err)
+			cfg = &RaftConfig{Name: name, Store: c.t.TempDir(), Log: ms}
+		}
 		s.bootstrapRaftNode(cfg, peers, true)
-		n, err := s.startRaftNode(globalAccountName, cfg)
+		n, err := s.startRaftNode(globalAccountName, cfg, pprofLabels{})
 		require_NoError(c.t, err)
 		sm := smf(s, cfg, n)
 		sg = append(sg, sm)
@@ -157,6 +187,7 @@ type stateAdder struct {
 	n   RaftNode
 	cfg *RaftConfig
 	sum int64
+	lch chan bool
 }
 
 // Simple getters for server and the raft node.
@@ -196,7 +227,12 @@ func (a *stateAdder) applyEntry(ce *CommittedEntry) {
 	a.n.Applied(ce.Index)
 }
 
-func (a *stateAdder) leaderChange(isLeader bool) {}
+func (a *stateAdder) leaderChange(isLeader bool) {
+	select {
+	case a.lch <- isLeader:
+	default:
+	}
+}
 
 // Adder specific to change the total.
 func (a *stateAdder) proposeDelta(delta int64) {
@@ -223,14 +259,21 @@ func (a *stateAdder) restart() {
 
 	// The filestore is stopped as well, so need to extract the parts to recreate it.
 	rn := a.n.(*raft)
-	fs := rn.wal.(*fileStore)
-
 	var err error
-	a.cfg.Log, err = newFileStore(fs.fcfg, fs.cfg.StreamConfig)
+
+	switch rn.wal.(type) {
+	case *fileStore:
+		fs := rn.wal.(*fileStore)
+		a.cfg.Log, err = newFileStore(fs.fcfg, fs.cfg.StreamConfig)
+	case *memStore:
+		ms := rn.wal.(*memStore)
+		a.cfg.Log, err = newMemStore(&ms.cfg)
+	}
 	if err != nil {
 		panic(err)
 	}
-	a.n, err = a.s.startRaftNode(globalAccountName, a.cfg)
+
+	a.n, err = a.s.startRaftNode(globalAccountName, a.cfg, pprofLabels{})
 	if err != nil {
 		panic(err)
 	}
@@ -272,5 +315,42 @@ func (rg smGroup) waitOnTotal(t *testing.T, expected int64) {
 
 // Factory function.
 func newStateAdder(s *Server, cfg *RaftConfig, n RaftNode) stateMachine {
-	return &stateAdder{s: s, n: n, cfg: cfg}
+	return &stateAdder{s: s, n: n, cfg: cfg, lch: make(chan bool, 1)}
+}
+
+func initSingleMemRaftNode(t *testing.T) (*raft, func()) {
+	t.Helper()
+	n, c := initSingleMemRaftNodeWithCluster(t)
+	cleanup := func() {
+		c.shutdown()
+	}
+	return n, cleanup
+}
+
+func initSingleMemRaftNodeWithCluster(t *testing.T) (*raft, *cluster) {
+	t.Helper()
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	s := c.servers[0] // RunBasicJetStreamServer not available
+
+	ms, err := newMemStore(&StreamConfig{Name: "TEST", Storage: MemoryStorage})
+	require_NoError(t, err)
+	cfg := &RaftConfig{Name: "TEST", Store: t.TempDir(), Log: ms}
+
+	err = s.bootstrapRaftNode(cfg, nil, false)
+	require_NoError(t, err)
+	n, err := s.initRaftNode(globalAccountName, cfg, pprofLabels{})
+	require_NoError(t, err)
+
+	return n, c
+}
+
+// Encode an AppendEntry.
+// An AppendEntry is encoded into a buffer and that's stored into the WAL.
+// This is a helper function to generate that buffer.
+func encode(t *testing.T, ae *appendEntry) *appendEntry {
+	t.Helper()
+	buf, err := ae.encode(nil)
+	require_NoError(t, err)
+	ae.buf = buf
+	return ae
 }

@@ -1,4 +1,4 @@
-// Copyright 2012-2019 The NATS Authors
+// Copyright 2012-2024 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -528,8 +528,8 @@ func TestRouteResendsLocalSubsOnReconnect(t *testing.T) {
 
 type ignoreLogger struct{}
 
-func (l *ignoreLogger) Fatalf(f string, args ...interface{}) {}
-func (l *ignoreLogger) Errorf(f string, args ...interface{}) {}
+func (l *ignoreLogger) Fatalf(f string, args ...any) {}
+func (l *ignoreLogger) Errorf(f string, args ...any) {}
 
 func TestRouteConnectOnShutdownRace(t *testing.T) {
 	s, opts := runRouteServer(t)

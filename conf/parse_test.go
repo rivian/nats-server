@@ -1,8 +1,11 @@
 package conf
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -11,7 +14,7 @@ import (
 
 // Test to make sure we get what we expect.
 
-func test(t *testing.T, data string, ex map[string]interface{}) {
+func test(t *testing.T, data string, ex map[string]any) {
 	t.Helper()
 	m, err := Parse(data)
 	if err != nil {
@@ -24,10 +27,31 @@ func test(t *testing.T, data string, ex map[string]interface{}) {
 	if !reflect.DeepEqual(m, ex) {
 		t.Fatalf("Not Equal:\nReceived: '%+v'\nExpected: '%+v'\n", m, ex)
 	}
+
+	// Also test ParseWithChecks
+	n, err := ParseWithChecks(data)
+	if err != nil {
+		t.Fatalf("Received err: %v\n", err)
+	}
+	if n == nil {
+		t.Fatal("Received nil map")
+	}
+	// Compare with the original results.
+	a, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(b, a) {
+		t.Fatalf("Not Equal:\nReceived: '%+v'\nExpected: '%+v'\n", string(a), string(b))
+	}
 }
 
 func TestSimpleTopLevel(t *testing.T) {
-	ex := map[string]interface{}{
+	ex := map[string]any{
 		"foo": "1",
 		"bar": float64(2.2),
 		"baz": true,
@@ -37,7 +61,7 @@ func TestSimpleTopLevel(t *testing.T) {
 }
 
 func TestBools(t *testing.T) {
-	ex := map[string]interface{}{
+	ex := map[string]any{
 		"foo": true,
 	}
 	test(t, "foo=true", ex)
@@ -53,7 +77,7 @@ var varSample = `
 `
 
 func TestSimpleVariable(t *testing.T) {
-	ex := map[string]interface{}{
+	ex := map[string]any{
 		"index": int64(22),
 		"foo":   int64(22),
 	}
@@ -70,9 +94,9 @@ var varNestedSample = `
 `
 
 func TestNestedVariable(t *testing.T) {
-	ex := map[string]interface{}{
+	ex := map[string]any{
 		"index": int64(22),
-		"nest": map[string]interface{}{
+		"nest": map[string]any{
 			"index": int64(11),
 			"foo":   int64(11),
 		},
@@ -92,7 +116,7 @@ func TestMissingVariable(t *testing.T) {
 }
 
 func TestEnvVariable(t *testing.T) {
-	ex := map[string]interface{}{
+	ex := map[string]any{
 		"foo": int64(22),
 	}
 	evar := "__UNIQ22__"
@@ -102,7 +126,7 @@ func TestEnvVariable(t *testing.T) {
 }
 
 func TestEnvVariableString(t *testing.T) {
-	ex := map[string]interface{}{
+	ex := map[string]any{
 		"foo": "xyz",
 	}
 	evar := "__UNIQ22__"
@@ -123,7 +147,7 @@ func TestEnvVariableStringStartingWithNumber(t *testing.T) {
 }
 
 func TestEnvVariableStringStartingWithNumberAndSizeUnit(t *testing.T) {
-	ex := map[string]interface{}{
+	ex := map[string]any{
 		"foo": "3Gyz",
 	}
 	evar := "__UNIQ22__"
@@ -133,7 +157,7 @@ func TestEnvVariableStringStartingWithNumberAndSizeUnit(t *testing.T) {
 }
 
 func TestEnvVariableStringStartingWithNumberUsingQuotes(t *testing.T) {
-	ex := map[string]interface{}{
+	ex := map[string]any{
 		"foo": "3xyz",
 	}
 	evar := "__UNIQ22__"
@@ -143,7 +167,7 @@ func TestEnvVariableStringStartingWithNumberUsingQuotes(t *testing.T) {
 }
 
 func TestBcryptVariable(t *testing.T) {
-	ex := map[string]interface{}{
+	ex := map[string]any{
 		"password": "$2a$11$ooo",
 	}
 	test(t, "password: $2a$11$ooo", ex)
@@ -171,7 +195,7 @@ pib = 22PiB
 `
 
 func TestConvenientNumbers(t *testing.T) {
-	ex := map[string]interface{}{
+	ex := map[string]any{
 		"k":   int64(8 * 1000),
 		"kb":  int64(4 * 1024),
 		"ki":  int64(3 * 1024),
@@ -205,13 +229,13 @@ foo  {
 `
 
 func TestSample1(t *testing.T) {
-	ex := map[string]interface{}{
-		"foo": map[string]interface{}{
-			"host": map[string]interface{}{
+	ex := map[string]any{
+		"foo": map[string]any{
+			"host": map[string]any{
 				"ip":   "127.0.0.1",
 				"port": int64(4242),
 			},
-			"servers": []interface{}{"a.com", "b.com", "c.com"},
+			"servers": []any{"a.com", "b.com", "c.com"},
 		},
 	}
 	test(t, sample1, ex)
@@ -241,15 +265,15 @@ cluster {
 `
 
 func TestSample2(t *testing.T) {
-	ex := map[string]interface{}{
-		"cluster": map[string]interface{}{
+	ex := map[string]any{
+		"cluster": map[string]any{
 			"port": int64(4244),
-			"authorization": map[string]interface{}{
+			"authorization": map[string]any{
 				"user":     "route_user",
 				"password": "top_secret",
 				"timeout":  int64(1),
 			},
-			"routes": []interface{}{
+			"routes": []any{
 				"nats-route://foo:bar@apcera.me:4245",
 				"nats-route://foo:bar@apcera.me:4246",
 			},
@@ -268,8 +292,8 @@ text block.'
 `
 
 func TestSample3(t *testing.T) {
-	ex := map[string]interface{}{
-		"foo": map[string]interface{}{
+	ex := map[string]any{
+		"foo": map[string]any{
 			"expr": "(true == \"false\")",
 			"text": "This is a multi-line\ntext block.",
 		},
@@ -285,10 +309,10 @@ var sample4 = `
 `
 
 func TestSample4(t *testing.T) {
-	ex := map[string]interface{}{
-		"array": []interface{}{
-			map[string]interface{}{"abc": int64(123)},
-			map[string]interface{}{"xyz": "word"},
+	ex := map[string]any{
+		"array": []any{
+			map[string]any{"abc": int64(123)},
+			map[string]any{"xyz": "word"},
 		},
 	}
 	test(t, sample4, ex)
@@ -302,7 +326,7 @@ var sample5 = `
 
 func TestSample5(t *testing.T) {
 	dt, _ := time.Parse("2006-01-02T15:04:05Z", "2016-05-04T18:53:41Z")
-	ex := map[string]interface{}{
+	ex := map[string]any{
 		"now": dt,
 		"gmt": false,
 	}
@@ -310,16 +334,16 @@ func TestSample5(t *testing.T) {
 }
 
 func TestIncludes(t *testing.T) {
-	ex := map[string]interface{}{
+	ex := map[string]any{
 		"listen": "127.0.0.1:4222",
-		"authorization": map[string]interface{}{
+		"authorization": map[string]any{
 			"ALICE_PASS": "$2a$10$UHR6GhotWhpLsKtVP0/i6.Nh9.fuY73cWjLoJjb2sKT8KISBcUW5q",
 			"BOB_PASS":   "$2a$11$dZM98SpGeI7dCFFGSpt.JObQcix8YHml4TBUZoge9R1uxnMIln5ly",
-			"users": []interface{}{
-				map[string]interface{}{
+			"users": []any{
+				map[string]any{
 					"user":     "alice",
 					"password": "$2a$10$UHR6GhotWhpLsKtVP0/i6.Nh9.fuY73cWjLoJjb2sKT8KISBcUW5q"},
-				map[string]interface{}{
+				map[string]any{
 					"user":     "bob",
 					"password": "$2a$11$dZM98SpGeI7dCFFGSpt.JObQcix8YHml4TBUZoge9R1uxnMIln5ly"},
 			},
@@ -365,11 +389,11 @@ func TestIncludeVariablesWithChecks(t *testing.T) {
 	if !ok {
 		t.Errorf("Expected %q to be in the config", key)
 	}
-	expectKeyVal := func(t *testing.T, m interface{}, expectedKey string, expectedVal string, expectedLine, expectedPos int) {
+	expectKeyVal := func(t *testing.T, m any, expectedKey string, expectedVal string, expectedLine, expectedPos int) {
 		t.Helper()
 		tk := m.(*token)
 		v := tk.Value()
-		vv := v.(map[string]interface{})
+		vv := v.(map[string]any)
 		value, ok := vv[expectedKey]
 		if !ok {
 			t.Errorf("Expected key %q", expectedKey)
@@ -401,5 +425,592 @@ func TestParserNoInfiniteLoop(t *testing.T) {
 		} else if !strings.Contains(err.Error(), "Unexpected EOF") {
 			t.Fatal("expected unexpected eof error")
 		}
+	}
+}
+
+func TestParseWithNoValuesAreInvalid(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		conf string
+		err  string
+	}{
+		{
+			"invalid key without values",
+			`aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`,
+			"config is invalid (:1:41)",
+		},
+		{
+			"invalid untrimmed key without values",
+			`              aaaaaaaaaaaaaaaaaaaaaaaaaaa`,
+			"config is invalid (:1:41)",
+		},
+		{
+			"invalid untrimmed key without values",
+			`     aaaaaaaaaaaaaaaaaaaaaaaaaaa         `,
+			"config is invalid (:1:41)",
+		},
+		{
+			"invalid keys after comments",
+			`
+          		# with comments and no spaces to create key values
+         		# is also an invalid config.
+         		aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                        `,
+			"config is invalid (:5:25)",
+		},
+		{
+			"comma separated without values are invalid",
+			`
+                        a,a,a,a,a,a,a,a,a,a,a
+                        `,
+			"config is invalid (:3:25)",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := parse(test.conf, "", true); err == nil {
+				t.Error("expected an error")
+			} else if !strings.Contains(err.Error(), test.err) {
+				t.Errorf("expected invalid conf error, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestParseWithNoValuesEmptyConfigsAreValid(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		conf string
+	}{
+		{
+			"empty conf",
+			"",
+		},
+		{
+			"empty conf with line breaks",
+			`
+
+
+                        `,
+		},
+		{
+			"just comments with no values",
+			`
+                        # just comments with no values
+                        # is still valid.
+                        `,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := parse(test.conf, "", true); err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestParseWithTrailingBracketsAreValid(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		conf string
+	}{
+		{
+			"empty conf",
+			"{}",
+		},
+		{
+			"just comments with no values",
+			`
+                        {
+                        # comments in the body
+                        }
+                        `,
+		},
+		{
+			// trailing brackets accidentally can become keys,
+			// this is valid since needed to support JSON like configs..
+			"trailing brackets after config",
+			`
+                        accounts { users = [{}]}
+                        }
+                        `,
+		},
+		{
+			"wrapped in brackets",
+			`{
+                          accounts { users = [{}]}
+                        }
+                        `,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := parse(test.conf, "", true); err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestParseWithNoValuesIncludes(t *testing.T) {
+	for _, test := range []struct {
+		input    string
+		includes map[string]string
+		err      string
+		linepos  string
+	}{
+		{
+			`# includes
+			accounts {
+                          foo { include 'foo.conf'}
+                          bar { users = [{user = "bar"}] }
+                          quux { include 'quux.conf'}
+                        }
+                        `,
+			map[string]string{
+				"foo.conf":  ``,
+				"quux.conf": `?????????????`,
+			},
+			"error parsing include file 'quux.conf', config is invalid",
+			"quux.conf:1:1",
+		},
+		{
+			`# includes
+			accounts {
+                          foo { include 'foo.conf'}
+                          bar { include 'bar.conf'}
+                          quux { include 'quux.conf'}
+                        }
+                        `,
+			map[string]string{
+				"foo.conf": ``, // Empty configs are ok
+				"bar.conf": `AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA`,
+				"quux.conf": `
+                                   # just some comments,
+                                   # and no key values also ok.
+                                `,
+			},
+			"error parsing include file 'bar.conf', config is invalid",
+			"bar.conf:1:34",
+		},
+	} {
+		t.Run("", func(t *testing.T) {
+			sdir := t.TempDir()
+			f, err := os.CreateTemp(sdir, "nats.conf-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(f.Name(), []byte(test.input), 066); err != nil {
+				t.Error(err)
+			}
+			if test.includes != nil {
+				for includeFile, contents := range test.includes {
+					inf, err := os.Create(filepath.Join(sdir, includeFile))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(inf.Name(), []byte(contents), 066); err != nil {
+						t.Error(err)
+					}
+				}
+			}
+			if _, err := parse(test.input, f.Name(), true); err == nil {
+				t.Error("expected an error")
+			} else if !strings.Contains(err.Error(), test.err) || !strings.Contains(err.Error(), test.linepos) {
+				t.Errorf("expected invalid conf error, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestJSONParseCompat(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		input    string
+		includes map[string]string
+		expected map[string]any
+	}{
+		{
+			"JSON with nested blocks",
+			`
+                        {
+                          "http_port": 8227,
+                          "port": 4227,
+                          "write_deadline": "1h",
+                          "cluster": {
+                            "port": 6222,
+                            "routes": [
+                              "nats://127.0.0.1:4222",
+                              "nats://127.0.0.1:4223",
+                              "nats://127.0.0.1:4224"
+                            ]
+                          }
+                        }
+                        `,
+			nil,
+			map[string]any{
+				"http_port":      int64(8227),
+				"port":           int64(4227),
+				"write_deadline": "1h",
+				"cluster": map[string]any{
+					"port": int64(6222),
+					"routes": []any{
+						"nats://127.0.0.1:4222",
+						"nats://127.0.0.1:4223",
+						"nats://127.0.0.1:4224",
+					},
+				},
+			},
+		},
+		{
+			"JSON with nested blocks",
+			`{
+                          "jetstream": {
+                            "store_dir": "/tmp/nats"
+                            "max_mem": 1000000,
+                          },
+                          "port": 4222,
+                          "server_name": "nats1"
+                        }
+                        `,
+			nil,
+			map[string]any{
+				"jetstream": map[string]any{
+					"store_dir": "/tmp/nats",
+					"max_mem":   int64(1_000_000),
+				},
+				"port":        int64(4222),
+				"server_name": "nats1",
+			},
+		},
+		{
+			"JSON empty object in one line",
+			`{}`,
+			nil,
+			map[string]any{},
+		},
+		{
+			"JSON empty object with line breaks",
+			`
+                        {
+                        }
+                        `,
+			nil,
+			map[string]any{},
+		},
+		{
+			"JSON includes",
+			`
+                        accounts {
+                          foo  { include 'foo.json'  }
+                          bar  { include 'bar.json'  }
+                          quux { include 'quux.json' }
+                        }
+                        `,
+			map[string]string{
+				"foo.json": `{ "users": [ {"user": "foo"} ] }`,
+				"bar.json": `{
+                                  "users": [ {"user": "bar"} ]
+                                }`,
+				"quux.json": `{}`,
+			},
+			map[string]any{
+				"accounts": map[string]any{
+					"foo": map[string]any{
+						"users": []any{
+							map[string]any{
+								"user": "foo",
+							},
+						},
+					},
+					"bar": map[string]any{
+						"users": []any{
+							map[string]any{
+								"user": "bar",
+							},
+						},
+					},
+					"quux": map[string]any{},
+				},
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sdir := t.TempDir()
+			f, err := os.CreateTemp(sdir, "nats.conf-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(f.Name(), []byte(test.input), 066); err != nil {
+				t.Error(err)
+			}
+			if test.includes != nil {
+				for includeFile, contents := range test.includes {
+					inf, err := os.Create(filepath.Join(sdir, includeFile))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(inf.Name(), []byte(contents), 066); err != nil {
+						t.Error(err)
+					}
+				}
+			}
+			m, err := ParseFile(f.Name())
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(m, test.expected) {
+				t.Fatalf("Not Equal:\nReceived: '%+v'\nExpected: '%+v'\n", m, test.expected)
+			}
+		})
+	}
+}
+
+func TestBlocks(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		input    string
+		expected map[string]any
+		err      string
+		linepos  string
+	}{
+		{
+			"inline block",
+			`{ listen: 0.0.0.0:4222 }`,
+			map[string]any{
+				"listen": "0.0.0.0:4222",
+			},
+			"", "",
+		},
+		{
+			"newline block",
+			`{
+				listen: 0.0.0.0:4222
+			 }`,
+			map[string]any{
+				"listen": "0.0.0.0:4222",
+			},
+			"", "",
+		},
+		{
+			"newline block with trailing comment",
+			`
+			{
+				listen: 0.0.0.0:4222
+			}
+			# wibble
+			`,
+			map[string]any{
+				"listen": "0.0.0.0:4222",
+			},
+			"", "",
+		},
+		{
+			"nested newline blocks with trailing comment",
+			`
+			{
+				{
+					listen: 0.0.0.0:4222 // random comment
+				}
+				# wibble1
+			}
+			# wibble2
+			`,
+			map[string]any{
+				"listen": "0.0.0.0:4222",
+			},
+			"", "",
+		},
+		{
+			"top line values in block scope",
+			`
+			{
+			  "debug":              False
+			  "prof_port":          8221
+			  "server_name":        "aws-useast2-natscj1-1"
+			}
+			`,
+			map[string]any{
+				"debug":       false,
+				"prof_port":   int64(8221),
+				"server_name": "aws-useast2-natscj1-1",
+			},
+			"", "",
+		},
+		{
+			"comment in block scope after value parse",
+			`
+			{
+			  "debug":              False
+			  "server_name":        "gcp-asianortheast3-natscj1-1"
+
+			  # Profile port specification.
+			  "prof_port":          8221
+			}
+			`,
+			map[string]any{
+				"debug":       false,
+				"prof_port":   int64(8221),
+				"server_name": "gcp-asianortheast3-natscj1-1",
+			},
+			"", "",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f, err := os.CreateTemp(t.TempDir(), "nats.conf-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(f.Name(), []byte(test.input), 066); err != nil {
+				t.Error(err)
+			}
+			if m, err := ParseFile(f.Name()); err == nil {
+				if !reflect.DeepEqual(m, test.expected) {
+					t.Fatalf("Not Equal:\nReceived: '%+v'\nExpected: '%+v'\n", m, test.expected)
+				}
+			} else if !strings.Contains(err.Error(), test.err) || !strings.Contains(err.Error(), test.linepos) {
+				t.Errorf("expected invalid conf error, got: %v", err)
+			} else if err != nil {
+				t.Error(err)
+			}
+		})
+	}
+}
+
+func TestParseDigest(t *testing.T) {
+	for _, test := range []struct {
+		input    string
+		includes map[string]string
+		digest   string
+	}{
+		{
+			`foo = bar`,
+			nil,
+			"sha256:226e49e13d16e5e8aa0d62e58cd63361bf097d3e2b2444aa3044334628a2e8de",
+		},
+		{
+			`# Comments and whitespace have no effect
+                        foo = bar
+                        `,
+			nil,
+			"sha256:226e49e13d16e5e8aa0d62e58cd63361bf097d3e2b2444aa3044334628a2e8de",
+		},
+		{
+			`# Syntax changes have no effect
+                        'foo': 'bar'
+                        `,
+			nil,
+			"sha256:226e49e13d16e5e8aa0d62e58cd63361bf097d3e2b2444aa3044334628a2e8de",
+		},
+		{
+			`# Syntax changes have no effect
+                        { 'foo': 'bar' }
+                        `,
+			nil,
+			"sha256:226e49e13d16e5e8aa0d62e58cd63361bf097d3e2b2444aa3044334628a2e8de",
+		},
+		{
+			`# substitutions
+                        BAR_USERS = { users = [ {user = "bar"} ]}
+                        hello = 'world'
+                        accounts {
+                          QUUX_USERS = [ { user: quux }]
+                          bar = $BAR_USERS
+                          quux = { users = $QUUX_USERS }
+                        }
+                        very { nested { env { VAR = 'NESTED', quux = $VAR }}}
+                        `,
+			nil,
+			"sha256:34f8faf3f269fe7509edc4742f20c8c4a7ad51fe21f8b361764314b533ac3ab5",
+		},
+		{
+			`# substitutions, same as previous one without env vars.
+                        hello = 'world'
+                        accounts {
+                          bar  = { users = [ { user = "bar" } ]}
+                          quux = { users = [ { user: quux   } ]}
+                        }
+                        very { nested { env { quux = 'NESTED' }}}
+                        `,
+			nil,
+			"sha256:34f8faf3f269fe7509edc4742f20c8c4a7ad51fe21f8b361764314b533ac3ab5",
+		},
+		{
+			`# substitutions
+                        BAR_USERS = { users = [ {user = "foo"} ]}
+                        bar = $BAR_USERS
+                        accounts {
+                          users = $BAR_USERS
+                        }
+                        `,
+			nil,
+			"sha256:f5d943b4ed22b80c6199203f8a7eaa8eb68ef7b2d46ef6b1b26f05e21f8beb13",
+		},
+		{
+			`# substitutions
+                        bar = { users = [ {user = "foo"} ]}
+                        accounts {
+                          users = { users = [ {user = "foo"} ]}
+                        }
+                        `,
+			nil,
+			"sha256:f5d943b4ed22b80c6199203f8a7eaa8eb68ef7b2d46ef6b1b26f05e21f8beb13",
+		},
+		{
+			`# includes
+			accounts {
+                          foo { include 'foo.conf'}
+                          bar { users = [{user = "bar"}] }
+                          quux { include 'quux.conf'}
+                        }
+                        `,
+			map[string]string{
+				"foo.conf":  ` users = [{user = "foo"}]`,
+				"quux.conf": ` users = [{user = "quux"}]`,
+			},
+			"sha256:e72d70c91b64b0f880f86decb95ec2600cbdcf8bdcd2355fce5ebc54a84a77e9",
+		},
+		{
+			`# includes
+			accounts {
+                          foo { include 'foo.conf'}
+                          bar { include 'bar.conf'}
+                          quux { include 'quux.conf'}
+                        }
+                        `,
+			map[string]string{
+				"foo.conf":  ` users = [{user = "foo"}]`,
+				"bar.conf":  ` users = [{user = "bar"}]`,
+				"quux.conf": ` users = [{user = "quux"}]`,
+			},
+			"sha256:e72d70c91b64b0f880f86decb95ec2600cbdcf8bdcd2355fce5ebc54a84a77e9",
+		},
+	} {
+		t.Run("", func(t *testing.T) {
+			sdir := t.TempDir()
+			f, err := os.CreateTemp(sdir, "nats.conf-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(f.Name(), []byte(test.input), 066); err != nil {
+				t.Error(err)
+			}
+			if test.includes != nil {
+				for includeFile, contents := range test.includes {
+					inf, err := os.Create(filepath.Join(sdir, includeFile))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(inf.Name(), []byte(contents), 066); err != nil {
+						t.Error(err)
+					}
+				}
+			}
+			_, digest, err := ParseFileWithChecksDigest(f.Name())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if digest != test.digest {
+				t.Errorf("\ngot: %s\nexpected: %s", digest, test.digest)
+			}
+		})
 	}
 }

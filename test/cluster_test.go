@@ -74,7 +74,7 @@ func checkExpectedSubs(expected int, servers ...*server.Server) error {
 	return nil
 }
 
-func checkSubInterest(t *testing.T, s *server.Server, accName, subject string, timeout time.Duration) {
+func checkSubInterest(t testing.TB, s *server.Server, accName, subject string, timeout time.Duration) {
 	t.Helper()
 	checkFor(t, timeout, 15*time.Millisecond, func() error {
 		acc, err := s.LookupAccount(accName)
@@ -598,7 +598,7 @@ type captureErrLogger struct {
 	ch chan string
 }
 
-func (c *captureErrLogger) Errorf(format string, v ...interface{}) {
+func (c *captureErrLogger) Errorf(format string, v ...any) {
 	msg := fmt.Sprintf(format, v...)
 	select {
 	case c.ch <- msg:

@@ -1,4 +1,4 @@
-// Copyright 2012-2019 The NATS Authors
+// Copyright 2012-2024 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -29,12 +29,14 @@ import (
 	"time"
 
 	"github.com/nats-io/nats-server/v2/server"
+
+	srvlog "github.com/nats-io/nats-server/v2/logger"
 )
 
 // So we can pass tests and benchmarks..
 type tLogger interface {
-	Fatalf(format string, args ...interface{})
-	Errorf(format string, args ...interface{})
+	Fatalf(format string, args ...any)
+	Errorf(format string, args ...any)
 }
 
 // DefaultTestOptions are default options for the unit tests.
@@ -79,6 +81,11 @@ func RunServerCallback(opts *server.Options, callback func(*server.Server)) *ser
 	opts.NoLog = !doLog
 	opts.Trace = doTrace
 	opts.Debug = doDebug
+	// For all tests in the "test" package, we will disable route pooling.
+	opts.Cluster.PoolSize = -1
+	// Also disable compression for "test" package.
+	opts.Cluster.Compression.Mode = server.CompressionOff
+	opts.LeafNode.Compression.Mode = server.CompressionOff
 
 	s, err := server.NewServer(opts)
 	if err != nil || s == nil {
@@ -87,6 +94,13 @@ func RunServerCallback(opts *server.Options, callback func(*server.Server)) *ser
 
 	if doLog {
 		s.ConfigureLogger()
+	}
+
+	if ll := os.Getenv("NATS_LOGGING"); ll != "" {
+		log := srvlog.NewTestLogger(fmt.Sprintf("[%s] | ", s), true)
+		debug := ll == "debug" || ll == "trace"
+		trace := ll == "trace"
+		s.SetLoggerV2(log, debug, trace, false)
 	}
 
 	if callback != nil {
@@ -130,7 +144,7 @@ func RunServerWithConfigOverrides(configFile string, optsCallback func(*server.O
 	return
 }
 
-func stackFatalf(t tLogger, f string, args ...interface{}) {
+func stackFatalf(t tLogger, f string, args ...any) {
 	lines := make([]string, 0, 32)
 	msg := fmt.Sprintf(f, args...)
 	lines = append(lines, msg)
@@ -342,25 +356,27 @@ func sendProto(t tLogger, c net.Conn, op string) {
 }
 
 var (
-	anyRe     = regexp.MustCompile(`.*`)
-	infoRe    = regexp.MustCompile(`INFO\s+([^\r\n]+)\r\n`)
-	pingRe    = regexp.MustCompile(`^PING\r\n`)
-	pongRe    = regexp.MustCompile(`^PONG\r\n`)
-	hmsgRe    = regexp.MustCompile(`(?:(?:HMSG\s+([^\s]+)\s+([^\s]+)\s+(([^\s]+)[^\S\r\n]+)?(\d+)\s+(\d+)\s*\r\n([^\\r\\n]*?)\r\n)+?)`)
-	msgRe     = regexp.MustCompile(`(?:(?:MSG\s+([^\s]+)\s+([^\s]+)\s+(([^\s]+)[^\S\r\n]+)?(\d+)\s*\r\n([^\\r\\n]*?)\r\n)+?)`)
-	rawMsgRe  = regexp.MustCompile(`(?:(?:MSG\s+([^\s]+)\s+([^\s]+)\s+(([^\s]+)[^\S\r\n]+)?(\d+)\s*\r\n(.*?)))`)
-	okRe      = regexp.MustCompile(`\A\+OK\r\n`)
-	errRe     = regexp.MustCompile(`\A\-ERR\s+([^\r\n]+)\r\n`)
-	connectRe = regexp.MustCompile(`CONNECT\s+([^\r\n]+)\r\n`)
-	rsubRe    = regexp.MustCompile(`RS\+\s+([^\s]+)\s+([^\s]+)\s*([^\s]+)?\s*(\d+)?\r\n`)
-	runsubRe  = regexp.MustCompile(`RS\-\s+([^\s]+)\s+([^\s]+)\s*([^\s]+)?\r\n`)
-	rmsgRe    = regexp.MustCompile(`(?:(?:RMSG\s+([^\s]+)\s+([^\s]+)\s+(?:([|+]\s+([\w\s]+)|[^\s]+)[^\S\r\n]+)?(\d+)\s*\r\n([^\\r\\n]*?)\r\n)+?)`)
-	asubRe    = regexp.MustCompile(`A\+\s+([^\r\n]+)\r\n`)
-	aunsubRe  = regexp.MustCompile(`A\-\s+([^\r\n]+)\r\n`)
-	lsubRe    = regexp.MustCompile(`LS\+\s+([^\s]+)\s*([^\s]+)?\s*(\d+)?\r\n`)
-	lunsubRe  = regexp.MustCompile(`LS\-\s+([^\s]+)\s*([^\s]+)?\r\n`)
-	lmsgRe    = regexp.MustCompile(`(?:(?:LMSG\s+([^\s]+)\s+(?:([|+]\s+([\w\s]+)|[^\s]+)[^\S\r\n]+)?(\d+)\s*\r\n([^\\r\\n]*?)\r\n)+?)`)
-	rlsubRe   = regexp.MustCompile(`LS\+\s+([^\s]+)\s+([^\s]+)\s+([^\s]+)\s*([^\s]+)?\s*(\d+)?\r\n`)
+	anyRe       = regexp.MustCompile(`.*`)
+	infoRe      = regexp.MustCompile(`INFO\s+([^\r\n]+)\r\n`)
+	infoStartRe = regexp.MustCompile(`^INFO\s+([^\r\n]+)\r\n`)
+	pingRe      = regexp.MustCompile(`^PING\r\n`)
+	pongRe      = regexp.MustCompile(`^PONG\r\n`)
+	hmsgRe      = regexp.MustCompile(`(?:(?:HMSG\s+([^\s]+)\s+([^\s]+)\s+(([^\s]+)[^\S\r\n]+)?(\d+)\s+(\d+)\s*\r\n([^\\r\\n]*?)\r\n)+?)`)
+	msgRe       = regexp.MustCompile(`(?:(?:MSG\s+([^\s]+)\s+([^\s]+)\s+(([^\s]+)[^\S\r\n]+)?(\d+)\s*\r\n([^\\r\\n]*?)\r\n)+?)`)
+	rawMsgRe    = regexp.MustCompile(`(?:(?:MSG\s+([^\s]+)\s+([^\s]+)\s+(([^\s]+)[^\S\r\n]+)?(\d+)\s*\r\n(.*?)))`)
+	okRe        = regexp.MustCompile(`\A\+OK\r\n`)
+	errRe       = regexp.MustCompile(`\A\-ERR\s+([^\r\n]+)\r\n`)
+	connectRe   = regexp.MustCompile(`CONNECT\s+([^\r\n]+)\r\n`)
+	rsubRe      = regexp.MustCompile(`RS\+\s+([^\s]+)\s+([^\s]+)\s*([^\s]+)?\s*(\d+)?\r\n`)
+	runsubRe    = regexp.MustCompile(`RS\-\s+([^\s]+)\s+([^\s]+)\s*([^\s]+)?\r\n`)
+	rmsgRe      = regexp.MustCompile(`(?:(?:RMSG\s+([^\s]+)\s+([^\s]+)\s+(?:([|+]\s+([\w\s]+)|[^\s]+)[^\S\r\n]+)?(\d+)\s*\r\n([^\\r\\n]*?)\r\n)+?)`)
+	asubRe      = regexp.MustCompile(`A\+\s+([^\r\n]+)\r\n`)
+	aunsubRe    = regexp.MustCompile(`A\-\s+([^\r\n]+)\r\n`)
+	lsubRe      = regexp.MustCompile(`LS\+\s+([^\s]+)\s*([^\s]+)?\s*(\d+)?\r\n`)
+	lunsubRe    = regexp.MustCompile(`LS\-\s+([^\s]+)\s*([^\s]+)\s*([^\s]+)?\r\n`)
+	lmsgRe      = regexp.MustCompile(`(?:(?:LMSG\s+([^\s]+)\s+(?:([|+]\s+([\w\s]+)|[^\s]+)[^\S\r\n]+)?(\d+)\s*\r\n([^\\r\\n]*?)\r\n)+?)`)
+	rlsubRe     = regexp.MustCompile(`LS\+\s+([^\s]+)\s+([^\s]+)\s+([^\s]+)\s*([^\s]+)?\s*(\d+)?\r\n`)
+	rlunsubRe   = regexp.MustCompile(`LS\-\s+([^\s]+)\s+([^\s]+)\s+([^\s]+)\s*([^\s]+)?\r\n`)
 )
 
 const (

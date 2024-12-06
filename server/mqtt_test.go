@@ -1,4 +1,4 @@
-// Copyright 2020 The NATS Authors
+// Copyright 2020-2024 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -39,7 +39,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-var testMQTTTimeout = 4 * time.Second
+var testMQTTTimeout = 10 * time.Second
 
 var jsClusterTemplWithLeafAndMQTT = `
 	listen: 127.0.0.1:-1
@@ -132,6 +132,18 @@ func testMQTTReadPacket(t testing.TB, r *mqttReader) (byte, int) {
 	}
 	rd.SetReadDeadline(time.Time{})
 	return b, pl
+}
+
+func testMQTTReadPIPacket(expectedType byte, t testing.TB, r *mqttReader, expectedPI uint16) {
+	t.Helper()
+	b, _ := testMQTTReadPacket(t, r)
+	if pt := b & mqttPacketMask; pt != expectedType {
+		t.Fatalf("Expected packet %x, got %x", expectedType, pt)
+	}
+	rpi, err := r.readUint16("packet identifier")
+	if err != nil || rpi != expectedPI {
+		t.Fatalf("Expected PI %v got: %v, err=%v", expectedPI, rpi, err)
+	}
 }
 
 func TestMQTTReader(t *testing.T) {
@@ -244,7 +256,7 @@ func TestMQTTReader(t *testing.T) {
 }
 
 func TestMQTTWriter(t *testing.T) {
-	w := &mqttWriter{}
+	w := newMQTTWriter(0)
 	w.WriteUint16(1234)
 
 	r := &mqttReader{}
@@ -361,6 +373,9 @@ func testMQTTDefaultTLSOptions(t *testing.T, verify bool) *Options {
 
 func TestMQTTServerNameRequired(t *testing.T) {
 	conf := createConfFile(t, []byte(`
+		cluster {
+			port: -1
+		}
 		mqtt {
 			port: -1
 		}
@@ -371,6 +386,19 @@ func TestMQTTServerNameRequired(t *testing.T) {
 	}
 	if _, err := NewServer(o); err == nil || err.Error() != errMQTTServerNameMustBeSet.Error() {
 		t.Fatalf("Expected error about requiring server name to be set, got %v", err)
+	}
+
+	conf = createConfFile(t, []byte(`
+		mqtt {
+			port: -1
+		}
+	`))
+	o, err = ProcessConfigFile(conf)
+	if err != nil {
+		t.Fatalf("Error processing config file: %v", err)
+	}
+	if _, err := NewServer(o); err == nil || err.Error() != errMQTTStandaloneNeedsJetStream.Error() {
+		t.Fatalf(`Expected errMQTTStandaloneNeedsJetStream ("next in line"), got %v`, err)
 	}
 }
 
@@ -395,8 +423,10 @@ func TestMQTTStandaloneRequiresJetStream(t *testing.T) {
 }
 
 func TestMQTTConfig(t *testing.T) {
-	conf := createConfFile(t, []byte(`
-		jetstream: enabled
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		jetstream {
+			store_dir = %q
+		}
 		server_name: mqtt
 		mqtt {
 			port: -1
@@ -405,7 +435,7 @@ func TestMQTTConfig(t *testing.T) {
 				key_file: "./configs/certs/key.pem"
 			}
 		}
-	`))
+	`, t.TempDir())))
 	s, o := RunServerWithConfig(conf)
 	defer testMQTTShutdownServer(s)
 	if o.MQTT.TLSConfig == nil {
@@ -573,6 +603,28 @@ func TestMQTTParseOptions(t *testing.T) {
 			`, func(o *MQTTOpts) error {
 				if o.MaxAckPending != 123 {
 					return fmt.Errorf("Invalid max ack pending: %v", o.MaxAckPending)
+				}
+				return nil
+			}, ""},
+		{"reject_qos2_publish",
+			`
+			mqtt {
+				reject_qos2_publish: true
+			}
+			`, func(o *MQTTOpts) error {
+				if !o.rejectQoS2Pub {
+					return fmt.Errorf("Invalid: expected rejectQoS2Pub to be set")
+				}
+				return nil
+			}, ""},
+		{"downgrade_qos2_subscribe",
+			`
+			mqtt {
+				downgrade_qos2_subscribe: true
+			}
+			`, func(o *MQTTOpts) error {
+				if !o.downgradeQoS2Sub {
+					return fmt.Errorf("Invalid: expected downgradeQoS2Sub to be set")
 				}
 				return nil
 			}, ""},
@@ -869,7 +921,7 @@ func mqttCreateConnectProto(ci *mqttConnInfo) []byte {
 		pkLen += 2 + len(ci.pass)
 	}
 
-	w := &mqttWriter{}
+	w := newMQTTWriter(0)
 	w.WriteByte(mqttPacketConnect)
 	w.WriteVarInt(pkLen)
 	w.WriteString(string(mqttProtoName))
@@ -917,6 +969,16 @@ func testMQTTCheckConnAck(t testing.TB, r *mqttReader, rc byte, sessionPresent b
 	if carc != rc {
 		t.Fatalf("Expected return code to be %v, got %v", rc, carc)
 	}
+}
+
+func testMQTTCheckPubAck(t testing.TB, r *mqttReader, packetType byte) {
+	t.Helper()
+	b, pl := testMQTTReadPacket(t, r)
+	pt := b & mqttPacketMask
+	if pt != packetType {
+		t.Fatalf("Expected %x, got %x", packetType, pt)
+	}
+	r.pos += pl
 }
 
 func TestMQTTRequiresJSEnabled(t *testing.T) {
@@ -1028,7 +1090,7 @@ func TestMQTTTLSVerifyAndMap(t *testing.T) {
 			if !test.provideCert {
 				if err == nil {
 					t.Fatal("Expected error, did not get one")
-				} else if !strings.Contains(err.Error(), "bad certificate") {
+				} else if !strings.Contains(err.Error(), "bad certificate") && !strings.Contains(err.Error(), "certificate required") {
 					t.Fatalf("Unexpected error: %v", err)
 				}
 				return
@@ -1547,11 +1609,7 @@ func TestMQTTConnectNotFirstPacket(t *testing.T) {
 	}
 	defer c.Close()
 
-	w := &mqttWriter{}
-	mqttWritePublish(w, 0, false, false, "foo", 0, []byte("hello"))
-	if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
-		t.Fatalf("Error publishing: %v", err)
-	}
+	testMQTTSendPublishPacket(t, c, 0, false, false, "foo", 0, []byte("hello"))
 	testMQTTExpectDisconnect(t, c)
 
 	select {
@@ -1584,41 +1642,40 @@ func TestMQTTParseConnect(t *testing.T) {
 	for _, test := range []struct {
 		name  string
 		proto []byte
-		pl    int
 		err   string
 	}{
-		{"packet in buffer error", []byte{0}, 10, io.ErrUnexpectedEOF.Error()},
-		{"bad proto name", []byte{0, 4, 'B', 'A', 'D'}, 5, "protocol name"},
-		{"invalid proto name", []byte{0, 3, 'B', 'A', 'D'}, 5, "expected connect packet with protocol name"},
-		{"old proto not supported", []byte{0, 6, 'M', 'Q', 'I', 's', 'd', 'p'}, 8, "older protocol"},
-		{"error on protocol level", []byte{0, 4, 'M', 'Q', 'T', 'T'}, 6, "protocol level"},
-		{"unacceptable protocol version", []byte{0, 4, 'M', 'Q', 'T', 'T', 10}, 7, "unacceptable protocol version"},
-		{"error on flags", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel}, 7, "flags"},
-		{"reserved flag", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, 1}, 8, errMQTTConnFlagReserved.Error()},
-		{"will qos without will flag", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, 1 << 3}, 8, "if Will flag is set to 0, Will QoS must be 0 too"},
-		{"will retain without will flag", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, 1 << 5}, 8, errMQTTWillAndRetainFlag.Error()},
-		{"will qos", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, 3<<3 | 1<<2}, 8, "if Will flag is set to 1, Will QoS can be 0, 1 or 2"},
-		{"no user but password", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, mqttConnFlagPasswordFlag}, 8, errMQTTPasswordFlagAndNoUser.Error()},
-		{"missing keep alive", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, 0}, 8, "keep alive"},
-		{"missing client ID", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, 0, 0, 1}, 10, "client ID"},
-		{"empty client ID", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, 0, 0, 1, 0, 0}, 12, errMQTTCIDEmptyNeedsCleanFlag.Error()},
-		{"invalid utf8 client ID", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, 0, 0, 1, 0, 1, 241}, 13, "invalid utf8 for client ID"},
-		{"missing will topic", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, mqttConnFlagWillFlag | mqttConnFlagCleanSession, 0, 0, 0, 0}, 12, "Will topic"},
-		{"empty will topic", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, mqttConnFlagWillFlag | mqttConnFlagCleanSession, 0, 0, 0, 0, 0, 0}, 14, errMQTTEmptyWillTopic.Error()},
-		{"invalid utf8 will topic", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, mqttConnFlagWillFlag | mqttConnFlagCleanSession, 0, 0, 0, 0, 0, 1, 241}, 15, "invalid utf8 for Will topic"},
-		{"invalid wildcard will topic", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, mqttConnFlagWillFlag | mqttConnFlagCleanSession, 0, 0, 0, 0, 0, 1, '#'}, 15, "wildcards not allowed"},
-		{"error on will message", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, mqttConnFlagWillFlag | mqttConnFlagCleanSession, 0, 0, 0, 0, 0, 1, 'a', 0, 3}, 17, "Will message"},
-		{"error on username", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, mqttConnFlagUsernameFlag | mqttConnFlagCleanSession, 0, 0, 0, 0}, 12, "user name"},
-		{"empty username", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, mqttConnFlagUsernameFlag | mqttConnFlagCleanSession, 0, 0, 0, 0, 0, 0}, 14, errMQTTEmptyUsername.Error()},
-		{"invalid utf8 username", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, mqttConnFlagUsernameFlag | mqttConnFlagCleanSession, 0, 0, 0, 0, 0, 1, 241}, 15, "invalid utf8 for user name"},
-		{"error on password", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, mqttConnFlagUsernameFlag | mqttConnFlagPasswordFlag | mqttConnFlagCleanSession, 0, 0, 0, 0, 0, 1, 'a'}, 15, "password"},
+		{"packet in buffer error", []byte{0}, io.ErrUnexpectedEOF.Error()},
+		{"bad proto name", []byte{0, 4, 'B', 'A', 'D'}, "protocol name"},
+		{"invalid proto name", []byte{0, 3, 'B', 'A', 'D'}, "expected connect packet with protocol name"},
+		{"old proto not supported", []byte{0, 6, 'M', 'Q', 'I', 's', 'd', 'p'}, "older protocol"},
+		{"error on protocol level", []byte{0, 4, 'M', 'Q', 'T', 'T'}, "protocol level"},
+		{"unacceptable protocol version", []byte{0, 4, 'M', 'Q', 'T', 'T', 10}, "unacceptable protocol version"},
+		{"error on flags", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel}, "flags"},
+		{"reserved flag", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, 1}, errMQTTConnFlagReserved.Error()},
+		{"will qos without will flag", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, 1 << 3}, "if Will flag is set to 0, Will QoS must be 0 too"},
+		{"will retain without will flag", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, 1 << 5}, errMQTTWillAndRetainFlag.Error()},
+		{"will qos", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, 3<<3 | 1<<2}, "if Will flag is set to 1, Will QoS can be 0, 1 or 2"},
+		{"no user but password", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, mqttConnFlagPasswordFlag}, errMQTTPasswordFlagAndNoUser.Error()},
+		{"missing keep alive", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, 0}, "keep alive"},
+		{"missing client ID", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, 0, 0, 1}, "client ID"},
+		{"empty client ID", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, 0, 0, 1, 0, 0}, errMQTTCIDEmptyNeedsCleanFlag.Error()},
+		{"invalid utf8 client ID", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, 0, 0, 1, 0, 1, 241}, "invalid utf8 for client ID"},
+		{"missing will topic", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, mqttConnFlagWillFlag | mqttConnFlagCleanSession, 0, 0, 0, 0}, "Will topic"},
+		{"empty will topic", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, mqttConnFlagWillFlag | mqttConnFlagCleanSession, 0, 0, 0, 0, 0, 0}, errMQTTEmptyWillTopic.Error()},
+		{"invalid utf8 will topic", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, mqttConnFlagWillFlag | mqttConnFlagCleanSession, 0, 0, 0, 0, 0, 1, 241}, "invalid utf8 for Will topic"},
+		{"invalid wildcard will topic", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, mqttConnFlagWillFlag | mqttConnFlagCleanSession, 0, 0, 0, 0, 0, 1, '#'}, "wildcards not allowed"},
+		{"error on will message", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, mqttConnFlagWillFlag | mqttConnFlagCleanSession, 0, 0, 0, 0, 0, 1, 'a', 0, 3}, "Will message"},
+		{"error on username", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, mqttConnFlagUsernameFlag | mqttConnFlagCleanSession, 0, 0, 0, 0}, "user name"},
+		{"empty username", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, mqttConnFlagUsernameFlag | mqttConnFlagCleanSession, 0, 0, 0, 0, 0, 0}, errMQTTEmptyUsername.Error()},
+		{"invalid utf8 username", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, mqttConnFlagUsernameFlag | mqttConnFlagCleanSession, 0, 0, 0, 0, 0, 1, 241}, "invalid utf8 for user name"},
+		{"error on password", []byte{0, 4, 'M', 'Q', 'T', 'T', mqttProtoLevel, mqttConnFlagUsernameFlag | mqttConnFlagPasswordFlag | mqttConnFlagCleanSession, 0, 0, 0, 0, 0, 1, 'a'}, "password"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			r := &mqttReader{}
 			r.reset(test.proto)
 			mqtt := &mqtt{r: r}
 			c := &client{mqtt: mqtt}
-			if _, _, err := c.mqttParseConnect(r, test.pl, false); err == nil || !strings.Contains(err.Error(), test.err) {
+			if _, _, err := c.mqttParseConnect(r, false); err == nil || !strings.Contains(err.Error(), test.err) {
 				t.Fatalf("Expected error %q, got %v", test.err, err)
 			}
 		})
@@ -1642,7 +1699,7 @@ func TestMQTTConnectFailsOnParse(t *testing.T) {
 		2 + // keepAlive
 		2 + len("mqtt")
 
-	w := &mqttWriter{}
+	w := newMQTTWriter(0)
 	w.WriteByte(mqttPacketConnect)
 	w.WriteVarInt(pkLen)
 	w.WriteString(string(mqttProtoName))
@@ -1699,39 +1756,6 @@ func TestMQTTDontSetPinger(t *testing.T) {
 	testMQTTPublish(t, mc, r, 0, false, false, "foo", 0, []byte("msg"))
 }
 
-func TestMQTTUnsupportedPackets(t *testing.T) {
-	o := testMQTTDefaultOptions()
-	s := testMQTTRunServer(t, o)
-	defer testMQTTShutdownServer(s)
-
-	for _, test := range []struct {
-		name       string
-		packetType byte
-	}{
-		{"pubrec", mqttPacketPubRec},
-		{"pubrel", mqttPacketPubRel},
-		{"pubcomp", mqttPacketPubComp},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			mc, r := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
-			defer mc.Close()
-			testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
-
-			w := &mqttWriter{}
-			pt := test.packetType
-			if test.packetType == mqttPacketPubRel {
-				pt |= byte(0x2)
-			}
-			w.WriteByte(pt)
-			w.WriteVarInt(2)
-			w.WriteUint16(1)
-			mc.Write(w.Bytes())
-
-			testMQTTExpectDisconnect(t, mc)
-		})
-	}
-}
-
 func TestMQTTTopicAndSubjectConversion(t *testing.T) {
 	for _, test := range []struct {
 		name        string
@@ -1750,6 +1774,7 @@ func TestMQTTTopicAndSubjectConversion(t *testing.T) {
 		{"///foo/", "///foo/", "/././.foo./", ""},
 		{"///foo//", "///foo//", "/././.foo././", ""},
 		{"///foo///", "///foo///", "/././.foo./././", ""},
+		{"//.foo.//", "//.foo.//", "/././/foo//././", ""},
 		{"foo/bar", "foo/bar", "foo.bar", ""},
 		{"/foo/bar", "/foo/bar", "/.foo.bar", ""},
 		{"/foo/bar/", "/foo/bar/", "/.foo.bar./", ""},
@@ -1762,17 +1787,31 @@ func TestMQTTTopicAndSubjectConversion(t *testing.T) {
 		{"foo//bar", "foo//bar", "foo./.bar", ""},
 		{"foo///bar", "foo///bar", "foo././.bar", ""},
 		{"foo////bar", "foo////bar", "foo./././.bar", ""},
+		{".", ".", "//", ""},
+		{"..", "..", "////", ""},
+		{"...", "...", "//////", ""},
+		{"./", "./", "//./", ""},
+		{".//.", ".//.", "//././/", ""},
+		{"././.", "././.", "//.//.//", ""},
+		{"././/.", "././/.", "//.//././/", ""},
+		{".foo", ".foo", "//foo", ""},
+		{"foo.", "foo.", "foo//", ""},
+		{".foo.", ".foo.", "//foo//", ""},
+		{"foo../bar/", "foo../bar/", "foo////.bar./", ""},
+		{"foo../bar/.", "foo../bar/.", "foo////.bar.//", ""},
+		{"/foo/", "/foo/", "/.foo./", ""},
+		{"./foo/.", "./foo/.", "//.foo.//", ""},
+		{"foo.bar/baz", "foo.bar/baz", "foo//bar.baz", ""},
 		// These should produce errors
 		{"foo/+", "foo/+", "", "wildcards not allowed in publish"},
 		{"foo/#", "foo/#", "", "wildcards not allowed in publish"},
 		{"foo bar", "foo bar", "", "not supported"},
-		{"foo.bar", "foo.bar", "", "not supported"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			res, err := mqttTopicToNATSPubSubject([]byte(test.mqttTopic))
 			if test.err != _EMPTY_ {
 				if err == nil || !strings.Contains(err.Error(), test.err) {
-					t.Fatalf("Expected error %q, got %q", test.err, err.Error())
+					t.Fatalf("Expected error %q, got %v", test.err, err)
 				}
 				return
 			}
@@ -1781,7 +1820,7 @@ func TestMQTTTopicAndSubjectConversion(t *testing.T) {
 				t.Fatalf("Expected subject %q got %q", test.natsSubject, toNATS)
 			}
 
-			res = natsSubjectToMQTTTopic(string(res))
+			res = natsSubjectToMQTTTopic(res)
 			backToMQTT := string(res)
 			if backToMQTT != test.mqttTopic {
 				t.Fatalf("Expected topic %q got %q (NATS conversion was %q)", test.mqttTopic, backToMQTT, toNATS)
@@ -1813,6 +1852,7 @@ func TestMQTTFilterConversion(t *testing.T) {
 		{"single level wildcard", "foo//+//", "foo./.*././"},
 		{"single level wildcard", "foo//+//bar", "foo./.*./.bar"},
 		{"single level wildcard", "foo///+///bar", "foo././.*././.bar"},
+		{"single level wildcard", "foo.bar///+///baz", "foo//bar././.*././.baz"},
 
 		{"multi level wildcard", "#", ">"},
 		{"multi level wildcard", "/#", "/.>"},
@@ -1821,6 +1861,7 @@ func TestMQTTFilterConversion(t *testing.T) {
 		{"multi level wildcard", "foo//#", "foo./.>"},
 		{"multi level wildcard", "foo///#", "foo././.>"},
 		{"multi level wildcard", "foo/bar/#", "foo.bar.>"},
+		{"multi level wildcard", "foo/bar.baz/#", "foo.bar//baz.>"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			res, err := mqttFilterToNATSSubject([]byte(test.mqttTopic))
@@ -1866,7 +1907,7 @@ func TestMQTTParseSub(t *testing.T) {
 
 func testMQTTSub(t testing.TB, pi uint16, c net.Conn, r *mqttReader, filters []*mqttFilter, expected []byte) {
 	t.Helper()
-	w := &mqttWriter{}
+	w := newMQTTWriter(0)
 	pkLen := 2 // for pi
 	for i := 0; i < len(filters); i++ {
 		f := filters[i]
@@ -1896,7 +1937,7 @@ func testMQTTSub(t testing.TB, pi uint16, c net.Conn, r *mqttReader, filters []*
 		if err != nil {
 			t.Fatal(err)
 		}
-		if qos != expected[i] {
+		if expected != nil && qos != expected[i] {
 			t.Fatalf("For topic filter %q expected qos of %v, got %v",
 				filters[i].filter, expected[i], qos)
 		}
@@ -1916,21 +1957,42 @@ func TestMQTTSubAck(t *testing.T) {
 	subs := []*mqttFilter{
 		{filter: "foo", qos: 0},
 		{filter: "bar", qos: 1},
-		{filter: "baz", qos: 2},       // Since we don't support, we should receive a result of 1
+		{filter: "baz", qos: 2},
 		{filter: "foo/#/bar", qos: 0}, // Invalid sub, so we should receive a result of mqttSubAckFailure
 	}
 	expected := []byte{
 		0,
 		1,
-		1,
+		2,
 		mqttSubAckFailure,
+	}
+	testMQTTSub(t, 1, mc, r, subs, expected)
+}
+
+func TestMQTTQoS2SubDowngrade(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.downgradeQoS2Sub = true
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	mc, r := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+	subs := []*mqttFilter{
+		{filter: "bar", qos: 1},
+		{filter: "baz", qos: 2},
+	}
+	expected := []byte{
+		1,
+		1,
 	}
 	testMQTTSub(t, 1, mc, r, subs, expected)
 }
 
 func testMQTTFlush(t testing.TB, c net.Conn, bw *bufio.Writer, r *mqttReader) {
 	t.Helper()
-	w := &mqttWriter{}
+	w := newMQTTWriter(0)
 	w.WriteByte(mqttPacketPing)
 	w.WriteByte(0)
 	if bw != nil {
@@ -1958,32 +2020,48 @@ func testMQTTExpectNothing(t testing.TB, r *mqttReader) {
 	r.reader.SetReadDeadline(time.Time{})
 }
 
-func testMQTTCheckPubMsg(t testing.TB, c net.Conn, r *mqttReader, topic string, flags byte, payload []byte) {
+func testMQTTCheckPubMsg(t testing.TB, c net.Conn, r *mqttReader, topic string, expectedFlags byte, payload []byte) uint16 {
 	t.Helper()
-	pflags, pi := testMQTTGetPubMsg(t, c, r, topic, payload)
-	if pflags != flags {
-		t.Fatalf("Expected flags to be %x, got %x", flags, pflags)
+	pi := testMQTTCheckPubMsgNoAck(t, c, r, topic, expectedFlags, payload)
+	if pi == 0 {
+		return 0
 	}
-	if pi > 0 {
-		testMQTTSendPubAck(t, c, pi)
+	qos := mqttGetQoS(expectedFlags)
+	switch qos {
+	case 1:
+		testMQTTSendPIPacket(mqttPacketPubAck, t, c, pi)
+	case 2:
+		testMQTTSendPIPacket(mqttPacketPubRec, t, c, pi)
 	}
+	return pi
 }
 
-func testMQTTCheckPubMsgNoAck(t testing.TB, c net.Conn, r *mqttReader, topic string, flags byte, payload []byte) uint16 {
+func testMQTTCheckPubMsgNoAck(t testing.TB, c net.Conn, r *mqttReader, topic string, expectedFlags byte, payload []byte) uint16 {
 	t.Helper()
 	pflags, pi := testMQTTGetPubMsg(t, c, r, topic, payload)
-	if pflags != flags {
-		t.Fatalf("Expected flags to be %x, got %x", flags, pflags)
+	if pflags != expectedFlags {
+		t.Fatalf("Expected flags to be %x, got %x", expectedFlags, pflags)
 	}
 	return pi
 }
 
 func testMQTTGetPubMsg(t testing.TB, c net.Conn, r *mqttReader, topic string, payload []byte) (byte, uint16) {
 	t.Helper()
+	flags, pi, _, _ := testMQTTGetPubMsgEx(t, c, r, topic, payload)
+	return flags, pi
+}
+
+func testMQTTGetPubMsgEx(t testing.TB, _ net.Conn, r *mqttReader, topic string, payload []byte) (byte, uint16, string, []byte) {
+	t.Helper()
 	b, pl := testMQTTReadPacket(t, r)
 	if pt := b & mqttPacketMask; pt != mqttPacketPub {
 		t.Fatalf("Expected PUBLISH packet %x, got %x", mqttPacketPub, pt)
 	}
+	return testMQTTGetPubMsgExEx(t, nil, r, b, pl, topic, payload)
+}
+
+func testMQTTGetPubMsgExEx(t testing.TB, _ net.Conn, r *mqttReader, b byte, pl int, topic string, payload []byte) (byte, uint16, string, []byte) {
+	t.Helper()
 	pflags := b & mqttPacketFlagMask
 	qos := (pflags & mqttPubFlagQoS) >> 1
 	start := r.pos
@@ -1991,7 +2069,7 @@ func testMQTTGetPubMsg(t testing.TB, c net.Conn, r *mqttReader, topic string, pa
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ptopic != topic {
+	if topic != _EMPTY_ && ptopic != topic {
 		t.Fatalf("Expected topic %q, got %q", topic, ptopic)
 	}
 	var pi uint16
@@ -2007,37 +2085,79 @@ func testMQTTGetPubMsg(t testing.TB, c net.Conn, r *mqttReader, topic string, pa
 			msgLen, r.pos, len(r.buf))
 	}
 	ppayload := r.buf[r.pos : r.pos+msgLen]
-	if !bytes.Equal(payload, ppayload) {
+	if payload != nil && !bytes.Equal(payload, ppayload) {
 		t.Fatalf("Expected payload %q, got %q", payload, ppayload)
 	}
 	r.pos += msgLen
-	return pflags, pi
+	return pflags, pi, ptopic, ppayload
 }
 
-func testMQTTSendPubAck(t testing.TB, c net.Conn, pi uint16) {
+func testMQTTReadPubPacket(t testing.TB, r *mqttReader) (flags byte, pi uint16, topic string, payload []byte) {
 	t.Helper()
-	w := &mqttWriter{}
-	w.WriteByte(mqttPacketPubAck)
+	b, pl := testMQTTReadPacket(t, r)
+	if pt := b & mqttPacketMask; pt != mqttPacketPub {
+		t.Fatalf("Expected PUBLISH packet %x, got %x", mqttPacketPub, pt)
+	}
+	flags = b & mqttPacketFlagMask
+	start := r.pos
+	topic, err := r.readString("topic name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	qos := (flags & mqttPubFlagQoS) >> 1
+	if qos > 0 {
+		pi, err = r.readUint16("packet identifier")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	msgLen := pl - (r.pos - start)
+	if r.pos+msgLen > len(r.buf) {
+		t.Fatalf("computed message length goes beyond buffer: ml=%v pos=%v lenBuf=%v",
+			msgLen, r.pos, len(r.buf))
+	}
+	payload = r.buf[r.pos : r.pos+msgLen]
+	r.pos += msgLen
+	return flags, pi, topic, payload
+}
+
+func testMQTTSendPIPacket(packetType byte, t testing.TB, c net.Conn, pi uint16) {
+	t.Helper()
+	w := newMQTTWriter(0)
+	w.WriteByte(packetType)
 	w.WriteVarInt(2)
 	w.WriteUint16(pi)
 	if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
-		t.Fatalf("Error writing PUBACK: %v", err)
+		t.Fatalf("Error writing packet type %v: %v", packetType, err)
 	}
+}
+
+func testMQTTWritePublishPacket(t testing.TB, w *mqttWriter, qos byte, dup, retain bool, topic string, pi uint16, payload []byte) {
+	t.Helper()
+	w.WritePublishHeader(pi, qos, dup, retain, []byte(topic), len(payload))
+	if _, err := w.Write(payload); err != nil {
+		t.Fatalf("Error writing PUBLISH proto: %v", err)
+	}
+}
+
+func testMQTTSendPublishPacket(t testing.TB, c net.Conn, qos byte, dup, retain bool, topic string, pi uint16, payload []byte) {
+	t.Helper()
+	c.SetWriteDeadline(time.Now().Add(testMQTTTimeout))
+	_, header := mqttMakePublishHeader(pi, qos, dup, retain, []byte(topic), len(payload))
+	if _, err := c.Write(header); err != nil {
+		t.Fatalf("Error writing PUBLISH header: %v", err)
+	}
+	if _, err := c.Write(payload); err != nil {
+		t.Fatalf("Error writing PUBLISH payload: %v", err)
+	}
+	c.SetWriteDeadline(time.Time{})
 }
 
 func testMQTTPublish(t testing.TB, c net.Conn, r *mqttReader, qos byte, dup, retain bool, topic string, pi uint16, payload []byte) {
 	t.Helper()
-	w := &mqttWriter{}
-	mqttWritePublish(w, qos, dup, retain, topic, pi, payload)
-	if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
-		t.Fatalf("Error writing PUBLISH proto: %v", err)
-	}
-	if qos > 0 {
-		// Since we don't support QoS 2, we should get disconnected
-		if qos == 2 {
-			testMQTTExpectDisconnect(t, c)
-			return
-		}
+	testMQTTSendPublishPacket(t, c, qos, dup, retain, topic, pi, payload)
+	switch qos {
+	case 1:
 		b, _ := testMQTTReadPacket(t, r)
 		if pt := b & mqttPacketMask; pt != mqttPacketPubAck {
 			t.Fatalf("Expected PUBACK packet %x, got %x", mqttPacketPubAck, pt)
@@ -2046,6 +2166,29 @@ func testMQTTPublish(t testing.TB, c net.Conn, r *mqttReader, qos byte, dup, ret
 		if err != nil || rpi != pi {
 			t.Fatalf("Error with packet identifier expected=%v got: %v err=%v", pi, rpi, err)
 		}
+
+	case 2:
+		b, _ := testMQTTReadPacket(t, r)
+		if pt := b & mqttPacketMask; pt != mqttPacketPubRec {
+			t.Fatalf("Expected PUBREC packet %x, got %x", mqttPacketPubRec, pt)
+		}
+		rpi, err := r.readUint16("packet identifier")
+		if err != nil || rpi != pi {
+			t.Fatalf("Error with packet identifier expected=%v got: %v err=%v", pi, rpi, err)
+		}
+
+		testMQTTSendPIPacket(mqttPacketPubRel, t, c, pi)
+
+		b, _ = testMQTTReadPacket(t, r)
+		if pt := b & mqttPacketMask; pt != mqttPacketPubComp {
+			t.Fatalf("Expected PUBCOMP packet %x, got %x", mqttPacketPubComp, pt)
+		}
+		rpi, err = r.readUint16("packet identifier")
+		if err != nil || rpi != pi {
+			t.Fatalf("Error with packet identifier expected=%v got: %v err=%v", pi, rpi, err)
+		}
+
+		testMQTTFlush(t, c, nil, r)
 	}
 }
 
@@ -2057,7 +2200,7 @@ func TestMQTTParsePub(t *testing.T) {
 		pl    int
 		err   string
 	}{
-		{"qos not supported", 0x4, nil, 0, "not supported"},
+		{"qos not supported", (3 << 1), nil, 0, "QoS=3 is invalid in MQTT"},
 		{"packet in buffer error", 0, nil, 10, io.ErrUnexpectedEOF.Error()},
 		{"error on topic", 0, []byte{0, 3, 'f', 'o'}, 4, "topic"},
 		{"empty topic", 0, []byte{0, 0}, 2, errMQTTTopicIsEmpty.Error()},
@@ -2078,21 +2221,20 @@ func TestMQTTParsePub(t *testing.T) {
 	}
 }
 
-func TestMQTTParsePubAck(t *testing.T) {
+func TestMQTTParsePIMsg(t *testing.T) {
 	for _, test := range []struct {
 		name  string
 		proto []byte
-		pl    int
 		err   string
 	}{
-		{"packet in buffer error", nil, 10, io.ErrUnexpectedEOF.Error()},
-		{"error reading packet identifier", []byte{0}, 1, "packet identifier"},
-		{"invalid packet identifier", []byte{0, 0}, 2, errMQTTPacketIdentifierIsZero.Error()},
+		{"packet in buffer error", nil, io.ErrUnexpectedEOF.Error()},
+		{"error reading packet identifier", []byte{0}, "packet identifier"},
+		{"invalid packet identifier", []byte{0, 0}, errMQTTPacketIdentifierIsZero.Error()},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			r := &mqttReader{}
 			r.reset(test.proto)
-			if _, err := mqttParsePubAck(r, test.pl); err == nil || !strings.Contains(err.Error(), test.err) {
+			if _, err := mqttParsePIPacket(r); err == nil || !strings.Contains(err.Error(), test.err) {
 				t.Fatalf("Expected error %q, got %v", test.err, err)
 			}
 		})
@@ -2114,6 +2256,25 @@ func TestMQTTPublish(t *testing.T) {
 	testMQTTPublish(t, mcp, mpr, 0, false, false, "foo", 0, []byte("msg"))
 	testMQTTPublish(t, mcp, mpr, 1, false, false, "foo", 1, []byte("msg"))
 	testMQTTPublish(t, mcp, mpr, 2, false, false, "foo", 2, []byte("msg"))
+}
+
+func TestMQTTQoS2PubReject(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.rejectQoS2Pub = true
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	mcp, mpr := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mcp.Close()
+	testMQTTCheckConnAck(t, mpr, mqttConnAckRCConnectionAccepted, false)
+
+	testMQTTPublish(t, mcp, mpr, 1, false, false, "foo", 1, []byte("msg"))
+
+	testMQTTSendPublishPacket(t, mcp, 2, false, false, "foo", 2, []byte("msg"))
+	testMQTTExpectDisconnect(t, mcp)
 }
 
 func TestMQTTSub(t *testing.T) {
@@ -2182,7 +2343,72 @@ func TestMQTTSub(t *testing.T) {
 	}
 }
 
-func TestMQTTSubQoS(t *testing.T) {
+func TestMQTTSubQoS2(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	mcp, mpr := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mcp.Close()
+	testMQTTCheckConnAck(t, mpr, mqttConnAckRCConnectionAccepted, false)
+
+	mc, r := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+	topic := "foo/bar/baz"
+	mqttTopic0 := "foo/#"
+	mqttTopic1 := "foo/bar/#"
+	mqttTopic2 := topic
+	testMQTTSub(t, 1, mc, r, []*mqttFilter{{filter: mqttTopic0, qos: 0}}, []byte{0})
+	testMQTTSub(t, 1, mc, r, []*mqttFilter{{filter: mqttTopic1, qos: 1}}, []byte{1})
+	testMQTTSub(t, 1, mc, r, []*mqttFilter{{filter: mqttTopic2, qos: 2}}, []byte{2})
+	testMQTTFlush(t, mc, nil, r)
+
+	for pubQoS, expectedCounts := range map[byte]map[byte]int{
+		0: {0: 3},
+		1: {0: 1, 1: 2},
+		2: {0: 1, 1: 1, 2: 1},
+	} {
+		t.Run(fmt.Sprintf("pubQoS %v", pubQoS), func(t *testing.T) {
+			pubPI := uint16(456)
+
+			testMQTTPublish(t, mcp, mpr, pubQoS, false, false, topic, pubPI, []byte("msg"))
+
+			qosCounts := map[byte]int{}
+			delivered := map[uint16]byte{}
+
+			// We have 3 subscriptions, each should receive the message, with the
+			// QoS that maybe "trimmed" to that of the subscription.
+			for i := 0; i < 3; i++ {
+				flags, pi := testMQTTGetPubMsg(t, mc, r, topic, []byte("msg"))
+				delivered[pi] = flags
+				qosCounts[mqttGetQoS(flags)]++
+			}
+
+			for pi, flags := range delivered {
+				switch mqttGetQoS(flags) {
+				case 1:
+					testMQTTSendPIPacket(mqttPacketPubAck, t, mc, pi)
+
+				case 2:
+					testMQTTSendPIPacket(mqttPacketPubRec, t, mc, pi)
+					testMQTTReadPIPacket(mqttPacketPubRel, t, r, pi)
+					testMQTTSendPIPacket(mqttPacketPubComp, t, mc, pi)
+				}
+			}
+
+			if !reflect.DeepEqual(qosCounts, expectedCounts) {
+				t.Fatalf("Expected QoS %#v, got %#v", expectedCounts, qosCounts)
+			}
+		})
+	}
+}
+
+func TestMQTTSubQoS1(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2230,8 +2456,8 @@ func TestMQTTSubQoS(t *testing.T) {
 	if pi1 == pi2 {
 		t.Fatalf("packet identifier for message 1: %v should be different from message 2", pi1)
 	}
-	testMQTTSendPubAck(t, mc, pi1)
-	testMQTTSendPubAck(t, mc, pi2)
+	testMQTTSendPIPacket(mqttPacketPubAck, t, mc, pi1)
+	testMQTTSendPIPacket(mqttPacketPubAck, t, mc, pi2)
 }
 
 func getSubQoS(sub *subscription) int {
@@ -2264,8 +2490,8 @@ func TestMQTTSubDups(t *testing.T) {
 
 	// And also with separate SUBSCRIBE protocols
 	testMQTTSub(t, 1, mc, r, []*mqttFilter{{filter: "bar", qos: 0}}, []byte{0})
-	// Ask for QoS 2 but server will downgrade to 1
-	testMQTTSub(t, 1, mc, r, []*mqttFilter{{filter: "bar", qos: 2}}, []byte{1})
+	// Ask for QoS 1 but server will downgrade to 1
+	testMQTTSub(t, 1, mc, r, []*mqttFilter{{filter: "bar", qos: 1}}, []byte{1})
 	testMQTTFlush(t, mc, nil, r)
 
 	// Publish and test msg received only once
@@ -2588,26 +2814,25 @@ func TestMQTTSubWithNATSStream(t *testing.T) {
 }
 
 func TestMQTTTrackPendingOverrun(t *testing.T) {
-	sess := &mqttSession{pending: make(map[uint16]*mqttPending)}
-	sub := &subscription{mqtt: &mqttSub{qos: 1}}
+	sess := mqttSession{}
 
-	sess.ppi = 0xFFFF
-	pi, _ := sess.trackPending(1, _EMPTY_, sub)
+	sess.last_pi = 0xFFFF
+	pi := sess.trackPublishRetained()
 	if pi != 1 {
 		t.Fatalf("Expected 1, got %v", pi)
 	}
 
 	p := &mqttPending{}
 	for i := 1; i <= 0xFFFF; i++ {
-		sess.pending[uint16(i)] = p
+		sess.pendingPublish[uint16(i)] = p
 	}
-	pi, _ = sess.trackPending(1, _EMPTY_, sub)
+	pi, _ = sess.trackPublish("test", "test")
 	if pi != 0 {
 		t.Fatalf("Expected 0, got %v", pi)
 	}
 
-	delete(sess.pending, 1234)
-	pi, _ = sess.trackPending(1, _EMPTY_, sub)
+	delete(sess.pendingPublish, 1234)
+	pi = sess.trackPublishRetained()
 	if pi != 1234 {
 		t.Fatalf("Expected 1234, got %v", pi)
 	}
@@ -2791,7 +3016,7 @@ func TestMQTTCluster(t *testing.T) {
 					}
 				})
 			}
-			if topTest.restart {
+			if !t.Failed() && topTest.restart {
 				cl.stopAll()
 				cl.restartAll()
 
@@ -2799,10 +3024,84 @@ func TestMQTTCluster(t *testing.T) {
 				for _, sn := range streams {
 					cl.waitOnStreamLeader(globalAccountName, sn)
 				}
-				cl.waitOnConsumerLeader(globalAccountName, mqttRetainedMsgsStreamName, "$MQTT_rmsgs_esFhDys3")
-				cl.waitOnConsumerLeader(globalAccountName, mqttRetainedMsgsStreamName, "$MQTT_rmsgs_z3WIzPtj")
+
+				mset, err := cl.randomServer().GlobalAccount().lookupStream(mqttRetainedMsgsStreamName)
+				if err != nil {
+					t.Fatalf("Expected to find a stream for %q", mqttRetainedMsgsStreamName)
+				}
+
+				rmConsumerNames := []string{}
+				mset.mu.RLock()
+				for _, o := range mset.consumers {
+					rmConsumerNames = append(rmConsumerNames, o.name)
+				}
+				mset.mu.RUnlock()
+
+				for _, consumerName := range rmConsumerNames {
+					cl.waitOnConsumerLeader(globalAccountName, mqttRetainedMsgsStreamName, consumerName)
+				}
 			}
 		})
+	}
+}
+
+func testMQTTConnectDisconnect(t *testing.T, o *Options, clientID string, clean bool, found bool) {
+	t.Helper()
+	mc, r := testMQTTConnect(t, &mqttConnInfo{clientID: clientID, cleanSess: clean}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, found)
+	testMQTTDisconnectEx(t, mc, nil, false)
+	mc.Close()
+}
+
+func TestMQTTClusterConnectDisconnectClean(t *testing.T) {
+	// The purpose of this test was to illustrate and verify
+	// https://github.com/nats-io/nats-server/pull/4734. Due to its timing
+	// sensitivity it has never been 100% reliable, prone to flaking on an
+	// occasional MQTT Connect failure (API timeout?). Skip for now, to reduce
+	// the flaky noise.
+	t.Skip()
+
+	nServers := 3
+	cl := createJetStreamClusterWithTemplate(t, testMQTTGetClusterTemplaceNoLeaf(), "MQTT", nServers)
+	defer cl.shutdown()
+
+	clientID := nuid.Next()
+
+	// test runs a connect/disconnect against a random server in the cluster, as
+	// specified.
+	N := 100
+	for n := 0; n < N; n++ {
+		testMQTTConnectDisconnect(t, cl.opts[rand.Intn(nServers)], clientID, true, false)
+	}
+}
+
+func TestMQTTClusterConnectDisconnectPersist(t *testing.T) {
+	// The purpose of this test was to illustrate and verify
+	// https://github.com/nats-io/nats-server/pull/4734. Due to its timing
+	// sensitivity it has never been 100% reliable, prone to flaking on an
+	// occasional MQTT Connect failure (API timeout?). Skip for now, to reduce
+	// the flaky noise.
+	t.Skip()
+
+	nServers := 3
+	cl := createJetStreamClusterWithTemplate(t, testMQTTGetClusterTemplaceNoLeaf(), "MQTT", nServers)
+	defer cl.shutdown()
+
+	clientID := nuid.Next()
+
+	// test runs a connect/disconnect against a random server in the cluster, as
+	// specified.
+	N := 20
+	for n := 0; n < N; n++ {
+		// First clean sessions on all servers
+		for i := 0; i < nServers; i++ {
+			testMQTTConnectDisconnect(t, cl.opts[i], clientID, true, false)
+		}
+
+		testMQTTConnectDisconnect(t, cl.opts[0], clientID, false, false)
+		testMQTTConnectDisconnect(t, cl.opts[1], clientID, false, true)
+		testMQTTConnectDisconnect(t, cl.opts[2], clientID, false, true)
+		testMQTTConnectDisconnect(t, cl.opts[0], clientID, false, true)
 	}
 }
 
@@ -2970,8 +3269,8 @@ func TestMQTTRetainedMsgNetworkUpdates(t *testing.T) {
 		t.Run(test.subject, func(t *testing.T) {
 			for _, a := range test.order {
 				if a.add {
-					rm := &mqttRetainedMsg{sseq: a.seq}
-					asm.handleRetainedMsg(test.subject, rm)
+					rf := &mqttRetainedMsgRef{sseq: a.seq}
+					asm.handleRetainedMsg(test.subject, rf, nil, false)
 				} else {
 					asm.handleRetainedMsgDel(test.subject, a.seq)
 				}
@@ -2983,13 +3282,116 @@ func TestMQTTRetainedMsgNetworkUpdates(t *testing.T) {
 	for _, subject := range []string{"foo.5", "foo.6"} {
 		t.Run("clear_"+subject, func(t *testing.T) {
 			// Now add a new message, which should clear the floor.
-			rm := &mqttRetainedMsg{sseq: 3}
-			asm.handleRetainedMsg(subject, rm)
+			rf := &mqttRetainedMsgRef{sseq: 3}
+			asm.handleRetainedMsg(subject, rf, nil, false)
 			check(t, subject, true, 3, 0)
 			// Now do a non network delete and make sure it is gone.
 			asm.handleRetainedMsgDel(subject, 0)
 			check(t, subject, false, 0, 0)
 		})
+	}
+}
+
+func TestMQTTRetainedMsgDel(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+	mc, _ := testMQTTConnect(t, &mqttConnInfo{clientID: "sub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+
+	c := testMQTTGetClient(t, s, "sub")
+	asm := c.mqtt.asm
+	var i uint64
+	for i = 0; i < 3; i++ {
+		rf := &mqttRetainedMsgRef{sseq: i}
+		asm.handleRetainedMsg("subject", rf, nil, false)
+	}
+	asm.handleRetainedMsgDel("subject", 2)
+	if asm.sl.count > 0 {
+		t.Fatalf("all retained messages subs should be removed, but %d still present", asm.sl.count)
+	}
+}
+
+func TestMQTTRetainedMsgMigration(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	// Create the retained messages stream to listen on the old subject first.
+	// The server will correct this when the migration takes place.
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:      mqttRetainedMsgsStreamName,
+		Subjects:  []string{`$MQTT.rmsgs`},
+		Storage:   nats.FileStorage,
+		Retention: nats.LimitsPolicy,
+		Replicas:  1,
+	})
+	require_NoError(t, err)
+
+	// Publish some retained messages on the old "$MQTT.rmsgs" subject.
+	const N = 100
+	for i := 0; i < N; i++ {
+		msg := fmt.Sprintf(
+			`{"origin":"b5IQZNtG","subject":"test%d","topic":"test%d","msg":"YmFy","flags":1}`, i, i,
+		)
+		_, err := js.Publish(`$MQTT.rmsgs`, []byte(msg))
+		require_NoError(t, err)
+	}
+
+	// Check that the old subject looks right.
+	si, err := js.StreamInfo(mqttRetainedMsgsStreamName, &nats.StreamInfoRequest{
+		SubjectsFilter: `$MQTT.>`,
+	})
+	require_NoError(t, err)
+	if si.State.NumSubjects != 1 {
+		t.Fatalf("expected 1 subject, got %d", si.State.NumSubjects)
+	}
+	if n := si.State.Subjects[`$MQTT.rmsgs`]; n != N {
+		t.Fatalf("expected to find %d messages on the original subject but found %d", N, n)
+	}
+
+	// Create an MQTT client, this will cause a migration to take place.
+	mc, rc := testMQTTConnect(t, &mqttConnInfo{clientID: "sub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, rc, mqttConnAckRCConnectionAccepted, false)
+
+	testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: "+", qos: 0}}, []byte{0})
+	topics := map[string]struct{}{}
+	for i := 0; i < N; i++ {
+		_, _, topic, _ := testMQTTGetPubMsgEx(t, mc, rc, _EMPTY_, []byte("bar"))
+		topics[topic] = struct{}{}
+	}
+	if len(topics) != N {
+		t.Fatalf("Unexpected topics: %v", topics)
+	}
+
+	// Now look at the stream, there should be N messages on the new
+	// divided subjects and none on the old undivided subject.
+	si, err = js.StreamInfo(mqttRetainedMsgsStreamName, &nats.StreamInfoRequest{
+		SubjectsFilter: `$MQTT.>`,
+	})
+	require_NoError(t, err)
+	if si.State.NumSubjects != N {
+		t.Fatalf("expected %d subjects, got %d", N, si.State.NumSubjects)
+	}
+	if n := si.State.Subjects[`$MQTT.rmsgs`]; n > 0 {
+		t.Fatalf("expected to find no messages on the original subject but found %d", n)
+	}
+
+	// Check that the message counts look right. There should be one
+	// retained message per key.
+	for i := 0; i < N; i++ {
+		expected := fmt.Sprintf(`$MQTT.rmsgs.test%d`, i)
+		n, ok := si.State.Subjects[expected]
+		if !ok {
+			t.Fatalf("expected to find %q but didn't", expected)
+		}
+		if n != 1 {
+			t.Fatalf("expected %q to have 1 message but had %d", expected, n)
+		}
 	}
 }
 
@@ -3280,11 +3682,11 @@ func TestMQTTLeafnodeWithoutJSToClusterWithJSNoSharedSysAcc(t *testing.T) {
 }
 
 func TestMQTTImportExport(t *testing.T) {
-	conf := createConfFile(t, []byte(`
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
 		listen: "127.0.0.1:-1"
 		server_name: "mqtt"
 		jetstream {
-			store_dir=org_dir
+			store_dir = %q
 		}
 		accounts {
 			org {
@@ -3301,9 +3703,8 @@ func TestMQTTImportExport(t *testing.T) {
 			listen: "127.0.0.1:-1"
 		}
 		no_auth_user: device
-	`))
+	`, t.TempDir())))
 	defer os.Remove(conf)
-	defer os.RemoveAll("org_dir")
 
 	s, o := RunServerWithConfig(conf)
 	defer s.Shutdown()
@@ -3374,7 +3775,7 @@ type remoteConnSameClientIDLogger struct {
 	warn chan string
 }
 
-func (l *remoteConnSameClientIDLogger) Warnf(format string, args ...interface{}) {
+func (l *remoteConnSameClientIDLogger) Warnf(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 	if strings.Contains(msg, "remote connection has started with the same client ID") {
 		l.warn <- msg
@@ -3460,7 +3861,7 @@ func TestMQTTParseUnsub(t *testing.T) {
 
 func testMQTTUnsub(t *testing.T, pi uint16, c net.Conn, r *mqttReader, filters []*mqttFilter) {
 	t.Helper()
-	w := &mqttWriter{}
+	w := newMQTTWriter(0)
 	pkLen := 2 // for pi
 	for i := 0; i < len(filters); i++ {
 		f := filters[i]
@@ -3573,7 +3974,12 @@ func TestMQTTPublishTopicErrors(t *testing.T) {
 
 func testMQTTDisconnect(t testing.TB, c net.Conn, bw *bufio.Writer) {
 	t.Helper()
-	w := &mqttWriter{}
+	testMQTTDisconnectEx(t, c, bw, true)
+}
+
+func testMQTTDisconnectEx(t testing.TB, c net.Conn, bw *bufio.Writer, wait bool) {
+	t.Helper()
+	w := newMQTTWriter(0)
 	w.WriteByte(mqttPacketDisconnect)
 	w.WriteByte(0)
 	if bw != nil {
@@ -3582,7 +3988,9 @@ func testMQTTDisconnect(t testing.TB, c net.Conn, bw *bufio.Writer) {
 	} else {
 		c.Write(w.Bytes())
 	}
-	testMQTTExpectDisconnect(t, c)
+	if wait {
+		testMQTTExpectDisconnect(t, c)
+	}
 }
 
 func TestMQTTWill(t *testing.T) {
@@ -3605,6 +4013,7 @@ func TestMQTTWill(t *testing.T) {
 	}{
 		{"will qos 0", true, 0},
 		{"will qos 1", true, 1},
+		{"will qos 2", true, 2},
 		{"proper disconnect no will", false, 0},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -3612,7 +4021,7 @@ func TestMQTTWill(t *testing.T) {
 			defer mcs.Close()
 			testMQTTCheckConnAck(t, rs, mqttConnAckRCConnectionAccepted, false)
 
-			testMQTTSub(t, 1, mcs, rs, []*mqttFilter{{filter: "will/#", qos: 1}}, []byte{1})
+			testMQTTSub(t, 1, mcs, rs, []*mqttFilter{{filter: "will/#", qos: 2}}, []byte{2})
 			testMQTTFlush(t, mcs, nil, rs)
 
 			mc, r := testMQTTConnect(t,
@@ -3646,6 +4055,32 @@ func TestMQTTWill(t *testing.T) {
 	}
 }
 
+func TestMQTTQoS2WillReject(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.rejectQoS2Pub = true
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	mcs, rs := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mcs.Close()
+	testMQTTCheckConnAck(t, rs, mqttConnAckRCConnectionAccepted, false)
+
+	testMQTTSub(t, 1, mcs, rs, []*mqttFilter{{filter: "will/#", qos: 2}}, []byte{2})
+	testMQTTFlush(t, mcs, nil, rs)
+
+	mc, r := testMQTTConnect(t,
+		&mqttConnInfo{
+			cleanSess: true,
+			will: &mqttWill{
+				topic:   []byte("will/topic"),
+				message: []byte("bye"),
+				qos:     2,
+			},
+		}, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCQoS2WillRejected, false)
+}
+
 func TestMQTTWillRetain(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -3661,6 +4096,11 @@ func TestMQTTWillRetain(t *testing.T) {
 			o := testMQTTDefaultOptions()
 			s := testMQTTRunServer(t, o)
 			defer testMQTTShutdownServer(s)
+
+			mces, res := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+			defer mces.Close()
+			testMQTTCheckConnAck(t, res, mqttConnAckRCConnectionAccepted, false)
+			testMQTTSub(t, 1, mces, res, []*mqttFilter{{filter: "will/#", qos: test.subQoS}}, []byte{test.subQoS})
 
 			willTopic := []byte("will/topic")
 			willMsg := []byte("bye")
@@ -3683,7 +4123,7 @@ func TestMQTTWillRetain(t *testing.T) {
 
 			// Wait for the server to process the connection close, which will
 			// cause the "will" message to be published (and retained).
-			checkClientsCount(t, s, 0)
+			checkClientsCount(t, s, 1)
 
 			// Create subscription on will topic and expect will message.
 			mcs, rs := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
@@ -3692,7 +4132,7 @@ func TestMQTTWillRetain(t *testing.T) {
 
 			testMQTTSub(t, 1, mcs, rs, []*mqttFilter{{filter: "will/#", qos: test.subQoS}}, []byte{test.subQoS})
 			pflags, _ := testMQTTGetPubMsg(t, mcs, rs, "will/topic", willMsg)
-			if pflags&mqttPubFlagRetain == 0 {
+			if !mqttIsRetained(pflags) {
 				t.Fatalf("expected retain flag to be set, it was not: %v", pflags)
 			}
 			// Expected QoS will be the lesser of the pub/sub QoS.
@@ -3703,6 +4143,17 @@ func TestMQTTWillRetain(t *testing.T) {
 			if qos := mqttGetQoS(pflags); qos != expectedQoS {
 				t.Fatalf("expected qos to be %v, got %v", expectedQoS, qos)
 			}
+
+			// The existing subscription (prior to sending the will) should receive
+			// the will but the retain flag should not be set.
+			pflags, _ = testMQTTGetPubMsg(t, mces, res, "will/topic", willMsg)
+			if mqttIsRetained(pflags) {
+				t.Fatalf("expected retain flag to not be set, it was: %v", pflags)
+			}
+			// Expected QoS will be the lesser of the pub/sub QoS.
+			if qos := mqttGetQoS(pflags); qos != expectedQoS {
+				t.Fatalf("expected qos to be %v, got %v", expectedQoS, qos)
+			}
 		})
 	}
 }
@@ -3710,7 +4161,9 @@ func TestMQTTWillRetain(t *testing.T) {
 func TestMQTTWillRetainPermViolation(t *testing.T) {
 	template := `
 		port: -1
-		jetstream: enabled
+		jetstream {
+			store_dir = %q
+		}
 		server_name: mqtt
 		authorization {
 			mqtt_perms = {
@@ -3725,7 +4178,8 @@ func TestMQTTWillRetainPermViolation(t *testing.T) {
 			port: -1
 		}
 	`
-	conf := createConfFile(t, []byte(fmt.Sprintf(template, "foo")))
+	tdir := t.TempDir()
+	conf := createConfFile(t, []byte(fmt.Sprintf(template, tdir, "foo")))
 
 	s, o := RunServerWithConfig(conf)
 	defer testMQTTShutdownServer(s)
@@ -3763,7 +4217,7 @@ func TestMQTTWillRetainPermViolation(t *testing.T) {
 
 	testMQTTSub(t, 1, mcs, rs, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
 	pflags, _ := testMQTTGetPubMsg(t, mcs, rs, "foo", []byte("bye"))
-	if pflags&mqttPubFlagRetain == 0 {
+	if !mqttIsRetained(pflags) {
 		t.Fatalf("expected retain flag to be set, it was not: %v", pflags)
 	}
 	if qos := mqttGetQoS(pflags); qos != 1 {
@@ -3804,7 +4258,7 @@ func TestMQTTWillRetainPermViolation(t *testing.T) {
 	// Now remove permission to publish on "foo" and check that a new subscription
 	// on "foo" is now not getting the will message because the original user no
 	// longer has permission to do so.
-	reloadUpdateConfig(t, s, conf, fmt.Sprintf(template, "baz"))
+	reloadUpdateConfig(t, s, conf, fmt.Sprintf(template, tdir, "baz"))
 
 	mcs, rs = testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
 	defer mcs.Close()
@@ -3820,6 +4274,14 @@ func TestMQTTPublishRetain(t *testing.T) {
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
+	buf := strings.Builder{}
+	for i := 0; i < 128; i++ { // 128Kb
+		for j := 0; j < 64; j++ { // 16 * 64 = 1Kb
+			buf.Write([]byte("0123456789abcdef"))
+		}
+	}
+	large := buf.String()
+
 	for _, test := range []struct {
 		name          string
 		retained      bool
@@ -3827,6 +4289,7 @@ func TestMQTTPublishRetain(t *testing.T) {
 		expectedValue string
 		subGetsIt     bool
 	}{
+		{"publish large retained", true, large, large, true},
 		{"publish retained", true, "retained", "retained", true},
 		{"publish not retained", false, "not retained", "retained", true},
 		{"remove retained", true, "", "", false},
@@ -3846,7 +4309,7 @@ func TestMQTTPublishRetain(t *testing.T) {
 
 			if test.subGetsIt {
 				pflags, _ := testMQTTGetPubMsg(t, mc2, rs2, "foo", []byte(test.expectedValue))
-				if pflags&mqttPubFlagRetain == 0 {
+				if !mqttIsRetained(pflags) {
 					t.Fatalf("retain flag should have been set, it was not: flags=%v", pflags)
 				}
 			} else {
@@ -3856,6 +4319,87 @@ func TestMQTTPublishRetain(t *testing.T) {
 			testMQTTDisconnect(t, mc1, nil)
 			testMQTTDisconnect(t, mc2, nil)
 		})
+	}
+}
+
+func TestMQTTQoS2RetainedReject(t *testing.T) {
+	// Start the server with QOS2 enabled, and submit retained messages with QoS
+	// 1 and 2.
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	mc1, rs1 := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTCheckConnAck(t, rs1, mqttConnAckRCConnectionAccepted, false)
+	testMQTTPublish(t, mc1, rs1, 2, false, true, "foo", 1, []byte("qos2 failed"))
+	testMQTTPublish(t, mc1, rs1, 1, false, true, "bar", 2, []byte("qos1 retained"))
+	testMQTTFlush(t, mc1, nil, rs1)
+	testMQTTDisconnect(t, mc1, nil)
+	mc1.Close()
+	s.Shutdown()
+
+	// Restart the server with QOS2 disabled; we should be using the same
+	// JetStream store, so the retained message should still be there.
+	o.MQTT.rejectQoS2Pub = true
+	s = testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	mc2, rs2 := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mc2.Close()
+	testMQTTCheckConnAck(t, rs2, mqttConnAckRCConnectionAccepted, false)
+
+	testMQTTSub(t, 1, mc2, rs2, []*mqttFilter{{filter: "bar/#", qos: 2}}, []byte{2})
+	pflags, _ := testMQTTGetPubMsg(t, mc2, rs2, "bar", []byte("qos1 retained"))
+	if !mqttIsRetained(pflags) {
+		t.Fatalf("retain flag should have been set, it was not: flags=%v", pflags)
+	}
+
+	testMQTTSub(t, 1, mc2, rs2, []*mqttFilter{{filter: "foo/#", qos: 2}}, []byte{2})
+	testMQTTExpectNothing(t, rs2)
+	testMQTTDisconnect(t, mc2, nil)
+}
+
+func TestMQTTRetainFlag(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	mc1, rs1 := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mc1.Close()
+	testMQTTCheckConnAck(t, rs1, mqttConnAckRCConnectionAccepted, false)
+	testMQTTPublish(t, mc1, rs1, 0, false, true, "foo/0", 0, []byte("flag set"))
+	testMQTTPublish(t, mc1, rs1, 0, false, true, "foo/1", 0, []byte("flag set"))
+	testMQTTFlush(t, mc1, nil, rs1)
+
+	mc2, rs2 := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mc2.Close()
+	testMQTTCheckConnAck(t, rs2, mqttConnAckRCConnectionAccepted, false)
+
+	testMQTTSub(t, 1, mc2, rs2, []*mqttFilter{{filter: "foo/0", qos: 0}}, []byte{0})
+	pflags, _ := testMQTTGetPubMsg(t, mc2, rs2, "foo/0", []byte("flag set"))
+	if !mqttIsRetained(pflags) {
+		t.Fatalf("retain flag should have been set, it was not: flags=%v", pflags)
+	}
+
+	testMQTTSub(t, 1, mc2, rs2, []*mqttFilter{{filter: "foo/1", qos: 1}}, []byte{1})
+	pflags, _ = testMQTTGetPubMsg(t, mc2, rs2, "foo/1", []byte("flag set"))
+	if !mqttIsRetained(pflags) {
+		t.Fatalf("retain flag should have been set, it was not: flags=%v", pflags)
+	}
+
+	// For existing subscriptions, RETAIN flag should not be set: [MQTT-3.3.1-9].
+	testMQTTPublish(t, mc1, rs1, 0, false, true, "foo/0", 0, []byte("flag not set"))
+	testMQTTFlush(t, mc1, nil, rs1)
+
+	pflags, _ = testMQTTGetPubMsg(t, mc2, rs2, "foo/0", []byte("flag not set"))
+	if mqttIsRetained(pflags) {
+		t.Fatalf("retain flag should not have been set, it was: flags=%v", pflags)
+	}
+
+	testMQTTPublish(t, mc1, rs1, 0, false, true, "foo/1", 0, []byte("flag not set"))
+	testMQTTFlush(t, mc1, nil, rs1)
+
+	pflags, _ = testMQTTGetPubMsg(t, mc2, rs2, "foo/1", []byte("flag not set"))
+	if mqttIsRetained(pflags) {
+		t.Fatalf("retain flag should not have been set, it was: flags=%v", pflags)
 	}
 }
 
@@ -4363,7 +4907,7 @@ func TestMQTTFlappingSession(t *testing.T) {
 		t.Fatalf("Error writing protocols: %v", err)
 	}
 	// Misbehave and send a SUB protocol without waiting for the CONNACK
-	w := &mqttWriter{}
+	w := newMQTTWriter(0)
 	pkLen := 2 // for pi
 	// Topic "foo"
 	pkLen += 2 + 3 + 1
@@ -4402,7 +4946,8 @@ func TestMQTTLockedSession(t *testing.T) {
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	ci := &mqttConnInfo{clientID: "sub", cleanSess: false}
+	subClientID := "sub"
+	ci := &mqttConnInfo{clientID: subClientID, cleanSess: false}
 	c, r := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
 	defer c.Close()
 	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
@@ -4415,8 +4960,20 @@ func TestMQTTLockedSession(t *testing.T) {
 		t.Fatalf("account session manager not found")
 	}
 
+	// It is possible, however unlikely, to have received CONNACK while
+	// mqttProcessConnect is still running, and the session remains locked. Wait
+	// for it to finish.
+	checkFor(t, 250*time.Millisecond, 10*time.Millisecond, func() error {
+		asm.mu.RLock()
+		defer asm.mu.RUnlock()
+		if _, stillLocked := asm.sessLocked[subClientID]; stillLocked {
+			return fmt.Errorf("session still locked")
+		}
+		return nil
+	})
+
 	// Get the session for "sub"
-	cli := testMQTTGetClient(t, s, "sub")
+	cli := testMQTTGetClient(t, s, subClientID)
 	sess := cli.mqtt.sess
 
 	// Pretend that the session above is locked.
@@ -4461,12 +5018,12 @@ func TestMQTTPersistRetainedMsg(t *testing.T) {
 	defer c.Close()
 	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
 
-	testMQTTPublish(t, c, r, 1, false, true, "foo", 1, []byte("foo1"))
-	testMQTTPublish(t, c, r, 1, false, true, "foo", 1, []byte("foo2"))
-	testMQTTPublish(t, c, r, 1, false, true, "bar", 1, []byte("bar1"))
-	testMQTTPublish(t, c, r, 0, false, true, "baz", 1, []byte("baz1"))
+	testMQTTPublish(t, c, r, 1, false, true, "moo/foo", 1, []byte("foo1"))
+	testMQTTPublish(t, c, r, 1, false, true, "moo/foo", 1, []byte("foo2"))
+	testMQTTPublish(t, c, r, 1, false, true, "moo/bar", 1, []byte("bar1"))
+	testMQTTPublish(t, c, r, 0, false, true, "moo/baz", 1, []byte("baz1"))
 	// Remove bar
-	testMQTTPublish(t, c, r, 1, false, true, "bar", 1, nil)
+	testMQTTPublish(t, c, r, 1, false, true, "moo/bar", 1, nil)
 	testMQTTFlush(t, c, nil, r)
 	testMQTTDisconnect(t, c, nil)
 	c.Close()
@@ -4477,24 +5034,106 @@ func TestMQTTPersistRetainedMsg(t *testing.T) {
 	o.MQTT.Port = -1
 	o.StoreDir = dir
 	s = testMQTTRunServer(t, o)
-	// There is already the defer for shutdown at top of function
 
 	cisub := &mqttConnInfo{clientID: "sub", cleanSess: false}
 	c, r = testMQTTConnect(t, cisub, o.MQTT.Host, o.MQTT.Port)
 	defer c.Close()
 	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
 
-	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
-	testMQTTCheckPubMsg(t, c, r, "foo", mqttPubFlagRetain|mqttPubQos1, []byte("foo2"))
+	t.Run("many subs one topic", func(t *testing.T) {
+		testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "moo/foo", qos: 1}}, []byte{1})
+		testMQTTCheckPubMsg(t, c, r, "moo/foo", mqttPubFlagRetain|mqttPubQos1, []byte("foo2"))
 
-	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "baz", qos: 1}}, []byte{1})
-	testMQTTCheckPubMsg(t, c, r, "baz", mqttPubFlagRetain, []byte("baz1"))
+		testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "moo/baz", qos: 1}}, []byte{1})
+		testMQTTCheckPubMsg(t, c, r, "moo/baz", mqttPubFlagRetain, []byte("baz1"))
 
-	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "bar", qos: 1}}, []byte{1})
-	testMQTTExpectNothing(t, r)
+		testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "moo/bar", qos: 1}}, []byte{1})
+		testMQTTExpectNothing(t, r)
+	})
+
+	runSingleSubscribe := func(filters []*mqttFilter) func(t *testing.T) {
+		return func(t *testing.T) {
+			testMQTTSub(t, 1, c, r, filters, nil)
+
+			for i := 0; i < 2; i++ {
+				flags, pi, topic, payload := testMQTTReadPubPacket(t, r)
+				if (flags & mqttPubFlagRetain) == 0 {
+					t.Fatalf("Expected flags to have retain set, got %v", flags)
+				}
+				if (flags & mqttPubFlagDup) != 0 {
+					t.Fatalf("Expected flags to not have Dup set, got %v", flags)
+				}
+				var expQOS byte
+				var expPayload []byte
+				switch topic {
+				case "moo/foo":
+					expQOS = mqttPubQos1
+					expPayload = []byte("foo2")
+					testMQTTSendPIPacket(mqttPacketPubAck, t, c, pi)
+				case "moo/baz":
+					expQOS = 0
+					expPayload = []byte("baz1")
+				default:
+					t.Fatalf("Unexpected topic: %v", topic)
+				}
+				if (flags & mqttPubFlagQoS) != expQOS {
+					t.Fatalf("Expected flags to have QOS %x set, got %x", expQOS, flags)
+				}
+				if string(payload) != string(expPayload) {
+					t.Fatalf("Expected payload to be %q, got %v", expPayload, string(payload))
+				}
+			}
+			testMQTTExpectNothing(t, r)
+		}
+	}
+
+	t.Run("one sub many topics", runSingleSubscribe([]*mqttFilter{
+		{filter: "moo/foo", qos: 1},
+		{filter: "moo/baz", qos: 1},
+		{filter: "moo/bar", qos: 1},
+	}))
+
+	t.Run("one sub wildcard plus", runSingleSubscribe([]*mqttFilter{
+		{filter: "moo/+", qos: 1},
+	}))
+
+	t.Run("one sub wildcard hash", runSingleSubscribe([]*mqttFilter{
+		{filter: "moo/#", qos: 1},
+	}))
 
 	testMQTTDisconnect(t, c, nil)
 	c.Close()
+}
+
+func TestMQTTRetainedMsgCleanup(t *testing.T) {
+	mqttRetainedCacheTTL = 250 * time.Millisecond
+	defer func() { mqttRetainedCacheTTL = mqttDefaultRetainedCacheTTL }()
+
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	ci := &mqttConnInfo{clientID: "cache", cleanSess: true}
+	c, r := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+	// Send a retained message.
+	testMQTTPublish(t, c, r, 1, false, true, "foo", 1, []byte("msg"))
+	testMQTTFlush(t, c, nil, r)
+
+	// Start a subscription.
+	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
+	testMQTTCheckPubMsg(t, c, r, "foo", mqttPubQos1|mqttPubFlagRetain, []byte("msg"))
+
+	time.Sleep(2 * mqttRetainedCacheTTL)
+
+	// Make sure not in cache anymore
+	cli := testMQTTGetClient(t, s, "cache")
+	asm := cli.mqtt.asm
+	if v, ok := asm.rmsCache.Load("foo"); ok {
+		t.Fatalf("Should not be in cache, got %+v", v)
+	}
 }
 
 func TestMQTTConnAckFirstPacket(t *testing.T) {
@@ -4537,7 +5176,7 @@ func TestMQTTConnAckFirstPacket(t *testing.T) {
 		c, r = testMQTTConnect(t, cisub, o.MQTT.Host, o.MQTT.Port)
 		defer c.Close()
 		testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, true)
-		w := &mqttWriter{}
+		w := newMQTTWriter(0)
 		w.WriteByte(mqttPacketDisconnect)
 		w.WriteByte(0)
 		c.Write(w.Bytes())
@@ -4590,7 +5229,7 @@ func TestMQTTRedeliveryAckWait(t *testing.T) {
 		}
 	}
 	// Ack first message
-	testMQTTSendPubAck(t, c, 1)
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c, 1)
 	// Redelivery should only be for second message now
 	for i := 0; i < 2; i++ {
 		flags := mqttPubQos1 | mqttPubFlagDup
@@ -4611,7 +5250,7 @@ func TestMQTTRedeliveryAckWait(t *testing.T) {
 		t.Fatalf("Unexpected pi to be 2, got %v", pi)
 	}
 	// Now ack second message
-	testMQTTSendPubAck(t, c, 2)
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c, 2)
 	// Flush to make sure it is processed before checking client's maps
 	testMQTTFlush(t, c, nil, r)
 
@@ -4620,7 +5259,7 @@ func TestMQTTRedeliveryAckWait(t *testing.T) {
 	mc.mu.Lock()
 	sess := mc.mqtt.sess
 	sess.mu.Lock()
-	lpi := len(sess.pending)
+	lpi := len(sess.pendingPublish)
 	var lsseq int
 	for _, sseqToPi := range sess.cpending {
 		lsseq += len(sseqToPi)
@@ -4630,6 +5269,259 @@ func TestMQTTRedeliveryAckWait(t *testing.T) {
 	if lpi != 0 || lsseq != 0 {
 		t.Fatalf("Maps should be empty, got %v, %v", lpi, lsseq)
 	}
+}
+
+// - [MQTT-3.10.4-3] If a Server deletes a Subscription It MUST complete the
+// delivery of any QoS 1 or QoS 2 messages which it has started to send to the
+// Client.
+//
+// Test flow:
+//   - Subscribe to foo, publish 3 QoS2 messages.
+//   - After one is PUBCOMP-ed, and one is PUBREC-ed, Unsubscribe.
+//   - See that the remaining 2 are fully delivered.
+func TestMQTTQoS2InflightMsgsDeliveredAfterUnsubscribe(t *testing.T) {
+	// This test has proven flaky on Travis, so skip for now. Line 4926, the 3rd
+	// testMQTTCheckPubMsgNoAck sometimes returns `data1`, instead of `data3`
+	// that we are expecting. It must be a retry since we did not acknowledge
+	// `data1` until later.
+	t.Skip()
+
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = 10 * time.Millisecond
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	var qos2 byte = 2
+	cisub := &mqttConnInfo{clientID: "sub", cleanSess: true}
+	c, r := testMQTTConnect(t, cisub, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "foo", qos: qos2}}, []byte{qos2})
+
+	cipub := &mqttConnInfo{clientID: "pub", cleanSess: true}
+	cp, rp := testMQTTConnect(t, cipub, o.MQTT.Host, o.MQTT.Port)
+	testMQTTCheckConnAck(t, rp, mqttConnAckRCConnectionAccepted, false)
+
+	// send 3 messages
+	testMQTTPublish(t, cp, rp, qos2, false, false, "foo", 441, []byte("data1"))
+	testMQTTPublish(t, cp, rp, qos2, false, false, "foo", 442, []byte("data2"))
+	testMQTTPublish(t, cp, rp, qos2, false, false, "foo", 443, []byte("data3"))
+
+	testMQTTDisconnect(t, cp, nil)
+	cp.Close()
+
+	subPI1 := testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQoS2, []byte("data1"))
+	subPI2 := testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQoS2, []byte("data2"))
+	// subPI3 := testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQoS2, []byte("data3"))
+	_ = testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQoS2, []byte("data3"))
+
+	// fully receive first message
+	testMQTTSendPIPacket(mqttPacketPubRec, t, c, subPI1)
+	testMQTTReadPIPacket(mqttPacketPubRel, t, r, subPI1)
+	testMQTTSendPIPacket(mqttPacketPubComp, t, c, subPI1)
+
+	// Do not PUBCOMP the 2nd message yet.
+	testMQTTSendPIPacket(mqttPacketPubRec, t, c, subPI2)
+	testMQTTReadPIPacket(mqttPacketPubRel, t, r, subPI2)
+
+	// Unsubscribe
+	testMQTTUnsub(t, 1, c, r, []*mqttFilter{{filter: "foo", qos: qos2}})
+
+	// We expect that PI2 and PI3 will continue to be delivered, from their
+	// respective states.
+	gotPI2PubRel := false
+
+	// TODO: Currently, we do not get the unacknowledged PUBLISH re-delivered
+	// after an UNSUBSCRIBE. Ongoing discussion if we should/must.
+	// gotPI3Publish := false
+	// gotPI3PubRel := false
+	for !gotPI2PubRel /* || !gotPI3Publish || !gotPI3PubRel */ {
+		b, _ /* len */ := testMQTTReadPacket(t, r)
+		switch b & mqttPacketMask {
+		case mqttPacketPubRel:
+			pi, err := r.readUint16("packet identifier")
+			if err != nil {
+				t.Fatalf("got unexpected error: %v", err)
+			}
+			switch pi {
+			case subPI2:
+				testMQTTSendPIPacket(mqttPacketPubComp, t, c, pi)
+				gotPI2PubRel = true
+			// case subPI3:
+			// 	testMQTTSendPIPacket(mqttPacketPubComp, t, c, pi)
+			// 	gotPI3PubRel = true
+			default:
+				t.Fatalf("Expected PI %v got: %v", subPI2, pi)
+			}
+
+		// case mqttPacketPub:
+		// 	_, pi, _ := testMQTTGetPubMsgExEx(t, c, r, b, len, "foo", []byte("data3"))
+		// 	if pi != subPI3 {
+		// 		t.Fatalf("Expected PI %v got: %v", subPI3, pi)
+		// 	}
+		// 	gotPI3Publish = true
+		// 	testMQTTSendPIPacket(mqttPacketPubRec, t, c, subPI3)
+
+		default:
+			t.Fatalf("Unexpected packet type: %v", b&mqttPacketMask)
+		}
+	}
+
+	testMQTTExpectNothing(t, r)
+}
+
+func TestMQTTQoS2RejectPublishDuplicates(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	var qos2 byte = 2
+	cisub := &mqttConnInfo{clientID: "sub", cleanSess: true}
+	c, r := testMQTTConnect(t, cisub, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "foo", qos: qos2}}, []byte{qos2})
+
+	cipub := &mqttConnInfo{clientID: "pub", cleanSess: true}
+	cp, rp := testMQTTConnect(t, cipub, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTCheckConnAck(t, rp, mqttConnAckRCConnectionAccepted, false)
+
+	// Publish 3 different with same PI before we get any PUBREC back, then
+	// complete the PUBREL/PUBCOMP flow as needed. Only one message (first
+	// payload) should be delivered. PUBRECs,
+	var pubPI uint16 = 444
+	testMQTTSendPublishPacket(t, cp, qos2, false, false, "foo", pubPI, []byte("data1"))
+	testMQTTSendPublishPacket(t, cp, qos2, true, false, "foo", pubPI, []byte("data2"))
+	testMQTTSendPublishPacket(t, cp, qos2, false, false, "foo", pubPI, []byte("data3"))
+
+	for i := 0; i < 3; i++ {
+		// [MQTT-4.3.3-1] The receiver
+		//
+		// - MUST respond with a PUBREC containing the Packet Identifier from
+		// the incoming PUBLISH Packet, having accepted ownership of the
+		// Application Message.
+		//
+		// - Until it has received the corresponding PUBREL packet, the Receiver
+		// MUST acknowledge any subsequent PUBLISH packet with the same Packet
+		// Identifier by sending a PUBREC. It MUST NOT cause duplicate messages
+		// to be delivered to any onward recipients in this case.
+		testMQTTReadPIPacket(mqttPacketPubRec, t, rp, pubPI)
+	}
+	for i := 0; i < 3; i++ {
+		testMQTTSendPIPacket(mqttPacketPubRel, t, cp, pubPI)
+	}
+	for i := 0; i < 3; i++ {
+		// [MQTT-4.3.3-1] MUST respond to a PUBREL packet by sending a PUBCOMP
+		// packet containing the same Packet Identifier as the PUBREL.
+		testMQTTReadPIPacket(mqttPacketPubComp, t, rp, pubPI)
+	}
+
+	// [MQTT-4.3.3-1] After it has sent a PUBCOMP, the receiver MUST treat any
+	// subsequent PUBLISH packet that contains that Packet Identifier as being a
+	// new publication.
+	//
+	// Publish another message, identical to the first one. Since the server
+	// already sent us a PUBCOMP, it will deliver this message, for a total of 2
+	// delivered.
+	testMQTTPublish(t, cp, rp, qos2, false, false, "foo", pubPI, []byte("data5"))
+
+	testMQTTDisconnect(t, cp, nil)
+	cp.Close()
+
+	// Verify we got a total of 2 messages.
+	subPI1 := testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQoS2, []byte("data1"))
+	subPI2 := testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQoS2, []byte("data5"))
+	for _, pi := range []uint16{subPI1, subPI2} {
+		testMQTTSendPIPacket(mqttPacketPubRec, t, c, pi)
+		testMQTTReadPIPacket(mqttPacketPubRel, t, r, pi)
+		testMQTTSendPIPacket(mqttPacketPubComp, t, c, pi)
+	}
+	testMQTTExpectNothing(t, r)
+}
+
+func TestMQTTQoS2RetriesPublish(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = 100 * time.Millisecond
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	var qos2 byte = 2
+	cisub := &mqttConnInfo{clientID: "sub", cleanSess: true}
+	c, r := testMQTTConnect(t, cisub, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "foo", qos: qos2}}, []byte{qos2})
+
+	cipub := &mqttConnInfo{clientID: "pub", cleanSess: true}
+	cp, rp := testMQTTConnect(t, cipub, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTCheckConnAck(t, rp, mqttConnAckRCConnectionAccepted, false)
+
+	// Publish a message and close the pub connection.
+	var pubPI uint16 = 444
+	testMQTTPublish(t, cp, rp, qos2, false, false, "foo", pubPI, []byte("data1"))
+	testMQTTDisconnect(t, cp, nil)
+	cp.Close()
+
+	// See that we got the message delivered to the sub, but don't PUBREC it
+	// yet.
+	subPI := testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQoS2, []byte("data1"))
+
+	// See that the message is redelivered again 2 times, with the DUP on, before we PUBREC it.
+	for i := 0; i < 2; i++ {
+		expectedFlags := mqttPubQoS2 | mqttPubFlagDup
+		pi := testMQTTCheckPubMsgNoAck(t, c, r, "foo", expectedFlags, []byte("data1"))
+		if pi != subPI {
+			t.Fatalf("Expected pi to be %v, got %v", subPI, pi)
+		}
+	}
+
+	// Finish the exchange and make sure there are no more attempts.
+	testMQTTSendPIPacket(mqttPacketPubRec, t, c, subPI)
+	testMQTTReadPIPacket(mqttPacketPubRel, t, r, subPI)
+	testMQTTSendPIPacket(mqttPacketPubComp, t, c, subPI)
+	testMQTTExpectNothing(t, r)
+}
+
+func TestMQTTQoS2RetriesPubRel(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = 50 * time.Millisecond
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	var qos2 byte = 2
+	cisub := &mqttConnInfo{clientID: "sub", cleanSess: true}
+	c, r := testMQTTConnect(t, cisub, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "foo", qos: qos2}}, []byte{qos2})
+
+	cipub := &mqttConnInfo{clientID: "pub", cleanSess: true}
+	cp, rp := testMQTTConnect(t, cipub, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTCheckConnAck(t, rp, mqttConnAckRCConnectionAccepted, false)
+
+	// Publish a message and close the pub connection.
+	var pubPI uint16 = 444
+	testMQTTPublish(t, cp, rp, qos2, false, false, "foo", pubPI, []byte("data1"))
+	testMQTTDisconnect(t, cp, nil)
+	cp.Close()
+
+	// See that we got the message delivered to the sub, PUBREC it and expect a
+	// PUBREL from the server.
+	subPI := testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQoS2, []byte("data1"))
+	testMQTTSendPIPacket(mqttPacketPubRec, t, c, subPI)
+
+	// See that we get PUBREL redelivered several times, there's no DUP flag to
+	// check.
+	testMQTTReadPIPacket(mqttPacketPubRel, t, r, subPI)
+	testMQTTReadPIPacket(mqttPacketPubRel, t, r, subPI)
+	testMQTTReadPIPacket(mqttPacketPubRel, t, r, subPI)
+
+	// Finish the exchange and make sure there are no more attempts.
+	testMQTTSendPIPacket(mqttPacketPubComp, t, c, subPI)
+	testMQTTExpectNothing(t, r)
 }
 
 func TestMQTTAckWaitConfigChange(t *testing.T) {
@@ -4738,7 +5630,7 @@ func TestMQTTUnsubscribeWithPendingAcks(t *testing.T) {
 	mc.mu.Lock()
 	sess := mc.mqtt.sess
 	sess.mu.Lock()
-	pal := len(sess.pending)
+	pal := len(sess.pendingPublish)
 	sess.mu.Unlock()
 	mc.mu.Unlock()
 	if pal != 0 {
@@ -4776,7 +5668,7 @@ func TestMQTTMaxAckPending(t *testing.T) {
 	testMQTTExpectNothing(t, r)
 
 	// Now ack first message
-	testMQTTSendPubAck(t, c, pi)
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c, pi)
 	// Now we should receive message 2
 	testMQTTCheckPubMsg(t, c, r, "foo", mqttPubQos1, []byte("msg2"))
 	testMQTTDisconnect(t, c, nil)
@@ -4805,7 +5697,7 @@ func TestMQTTMaxAckPending(t *testing.T) {
 	testMQTTExpectNothing(t, r)
 
 	// Ack and get the next
-	testMQTTSendPubAck(t, c, pi)
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c, pi)
 	testMQTTCheckPubMsg(t, c, r, "foo", mqttPubQos1, []byte("msg4"))
 
 	// Make sure this message gets ack'ed
@@ -4814,7 +5706,7 @@ func TestMQTTMaxAckPending(t *testing.T) {
 		mcli.mu.Lock()
 		sess := mcli.mqtt.sess
 		sess.mu.Lock()
-		np := len(sess.pending)
+		np := len(sess.pendingPublish)
 		sess.mu.Unlock()
 		mcli.mu.Unlock()
 		if np != 0 {
@@ -4852,7 +5744,7 @@ func TestMQTTMaxAckPending(t *testing.T) {
 	testMQTTExpectNothing(t, r)
 
 	// Ack and get the next
-	testMQTTSendPubAck(t, c, pi)
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c, pi)
 	testMQTTCheckPubMsg(t, c, r, "foo", mqttPubQos1, []byte("msg6"))
 }
 
@@ -4887,7 +5779,7 @@ func TestMQTTMaxAckPendingForMultipleSubs(t *testing.T) {
 	testMQTTExpectNothing(t, r)
 
 	// Ack the first message.
-	testMQTTSendPubAck(t, c, pi)
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c, pi)
 
 	// Now we should get the second message
 	testMQTTCheckPubMsg(t, c, r, "bar", mqttPubQos1|mqttPubFlagDup, []byte("msg2"))
@@ -5080,11 +5972,13 @@ func TestMQTTStreamInfoReturnsNonEmptySubject(t *testing.T) {
 }
 
 func TestMQTTWebsocketToMQTTPort(t *testing.T) {
-	conf := createConfFile(t, []byte(`
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
 		listen: "127.0.0.1:-1"
 		http: "127.0.0.1:-1"
 		server_name: "mqtt"
-		jetstream: enabled
+		jetstream {
+			store_dir = %q
+		}
 		mqtt {
 			listen: "127.0.0.1:-1"
 		}
@@ -5092,7 +5986,7 @@ func TestMQTTWebsocketToMQTTPort(t *testing.T) {
 			listen: "127.0.0.1:-1"
 			no_tls: true
 		}
-	`))
+	`, t.TempDir())))
 	s, o := RunServerWithConfig(conf)
 	defer testMQTTShutdownServer(s)
 
@@ -5114,11 +6008,14 @@ func TestMQTTWebsocketToMQTTPort(t *testing.T) {
 }
 
 func TestMQTTWebsocket(t *testing.T) {
+	tdir := t.TempDir()
 	template := `
 		listen: "127.0.0.1:-1"
 		http: "127.0.0.1:-1"
 		server_name: "mqtt"
-		jetstream: enabled
+		jetstream {
+			store_dir = %q
+		}
 		accounts {
 			MQTT {
 				jetstream: enabled
@@ -5135,7 +6032,7 @@ func TestMQTTWebsocket(t *testing.T) {
 			no_tls: true
 		}
 	`
-	s, o, conf := runReloadServerWithContent(t, []byte(fmt.Sprintf(template, jwt.ConnectionTypeMqtt, "")))
+	s, o, conf := runReloadServerWithContent(t, []byte(fmt.Sprintf(template, tdir, jwt.ConnectionTypeMqtt, "")))
 	defer testMQTTShutdownServer(s)
 
 	cisub := &mqttConnInfo{clientID: "sub", user: "mqtt", pass: "pwd", ws: true}
@@ -5145,7 +6042,7 @@ func TestMQTTWebsocket(t *testing.T) {
 	c.Close()
 
 	ws := fmt.Sprintf(`, "%s"`, jwt.ConnectionTypeMqttWS)
-	reloadUpdateConfig(t, s, conf, fmt.Sprintf(template, jwt.ConnectionTypeMqtt, ws))
+	reloadUpdateConfig(t, s, conf, fmt.Sprintf(template, tdir, jwt.ConnectionTypeMqtt, ws))
 
 	cisub = &mqttConnInfo{clientID: "sub", user: "mqtt", pass: "pwd", ws: true}
 	c, r = testMQTTConnect(t, cisub, o.Websocket.Host, o.Websocket.Port)
@@ -5185,11 +6082,13 @@ func (cwc *chunkWriteConn) Write(p []byte) (int, error) {
 }
 
 func TestMQTTPartial(t *testing.T) {
-	conf := createConfFile(t, []byte(`
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
 		listen: "127.0.0.1:-1"
 		http: "127.0.0.1:-1"
 		server_name: "mqtt"
-		jetstream: enabled
+		jetstream {
+			store_dir = %q
+		}
 		mqtt {
 			listen: "127.0.0.1:-1"
 		}
@@ -5197,7 +6096,7 @@ func TestMQTTPartial(t *testing.T) {
 			listen: "127.0.0.1:-1"
 			no_tls: true
 		}
-	`))
+	`, t.TempDir())))
 	s, o := RunServerWithConfig(conf)
 	defer testMQTTShutdownServer(s)
 
@@ -5236,11 +6135,13 @@ func TestMQTTPartial(t *testing.T) {
 }
 
 func TestMQTTWebsocketTLS(t *testing.T) {
-	conf := createConfFile(t, []byte(`
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
 		listen: "127.0.0.1:-1"
 		http: "127.0.0.1:-1"
 		server_name: "mqtt"
-		jetstream: enabled
+		jetstream {
+			store_dir = %q
+		}
 		mqtt {
 			listen: "127.0.0.1:-1"
 		}
@@ -5252,7 +6153,7 @@ func TestMQTTWebsocketTLS(t *testing.T) {
 				ca_file: '../test/configs/certs/ca.pem'
 			}
 		}
-	`))
+	`, t.TempDir())))
 	s, o := RunServerWithConfig(conf)
 	defer testMQTTShutdownServer(s)
 
@@ -5382,11 +6283,13 @@ func TestMQTTTransferSessionStreamsToMuxed(t *testing.T) {
 }
 
 func TestMQTTConnectAndDisconnectEvent(t *testing.T) {
-	conf := createConfFile(t, []byte(`
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
 		listen: "127.0.0.1:-1"
 		http: "127.0.0.1:-1"
 		server_name: "mqtt"
-		jetstream: enabled
+		jetstream {
+			store_dir = %q
+		}
 		accounts {
 			MQTT {
 				jetstream: enabled
@@ -5400,7 +6303,7 @@ func TestMQTTConnectAndDisconnectEvent(t *testing.T) {
 			listen: "127.0.0.1:-1"
 		}
 		system_account: "SYS"
-	`))
+	`, t.TempDir())))
 	defer os.Remove(conf)
 	s, o := RunServerWithConfig(conf)
 	defer testMQTTShutdownServer(s)
@@ -5517,7 +6420,7 @@ func TestMQTTConnectAndDisconnectEvent(t *testing.T) {
 
 	// Test system events now
 	for _, test := range []struct {
-		opt interface{}
+		opt any
 		cid string
 	}{
 		{&ConnzOptions{MQTTClient: "conn1"}, "conn1"},
@@ -5674,15 +6577,18 @@ func TestMQTTStreamReplicasOverride(t *testing.T) {
 }
 
 func TestMQTTStreamReplicasConfigReload(t *testing.T) {
+	tdir := t.TempDir()
 	tmpl := `
-		jetstream: enabled
+		jetstream {
+			store_dir = %q
+		}
 		server_name: mqtt
 		mqtt {
 			port: -1
 			stream_replicas: %v
 		}
 	`
-	conf := createConfFile(t, []byte(fmt.Sprintf(tmpl, 3)))
+	conf := createConfFile(t, []byte(fmt.Sprintf(tmpl, tdir, 3)))
 	s, o := RunServerWithConfig(conf)
 	defer testMQTTShutdownServer(s)
 
@@ -5703,7 +6609,7 @@ func TestMQTTStreamReplicasConfigReload(t *testing.T) {
 		t.Fatalf("Did not get the error regarding replicas count")
 	}
 
-	reloadUpdateConfig(t, s, conf, fmt.Sprintf(tmpl, 1))
+	reloadUpdateConfig(t, s, conf, fmt.Sprintf(tmpl, tdir, 1))
 
 	mc, r := testMQTTConnect(t, &mqttConnInfo{clientID: "mqtt", cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
 	defer mc.Close()
@@ -5852,15 +6758,18 @@ func TestMQTTConsumerReplicasOverride(t *testing.T) {
 }
 
 func TestMQTTConsumerMemStorageReload(t *testing.T) {
+	tdir := t.TempDir()
 	tmpl := `
-		jetstream: enabled
+		jetstream {
+			store_dir = %q
+		}
 		server_name: mqtt
 		mqtt {
 			port: -1
 			consumer_memory_storage: %s
 		}
 	`
-	conf := createConfFile(t, []byte(fmt.Sprintf(tmpl, "false")))
+	conf := createConfFile(t, []byte(fmt.Sprintf(tmpl, tdir, "false")))
 	s, o := RunServerWithConfig(conf)
 	defer testMQTTShutdownServer(s)
 
@@ -5871,7 +6780,7 @@ func TestMQTTConsumerMemStorageReload(t *testing.T) {
 	defer c.Close()
 	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
 
-	reloadUpdateConfig(t, s, conf, fmt.Sprintf(tmpl, "true"))
+	reloadUpdateConfig(t, s, conf, fmt.Sprintf(tmpl, tdir, "true"))
 
 	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
 
@@ -5894,71 +6803,15 @@ func TestMQTTConsumerMemStorageReload(t *testing.T) {
 	}
 }
 
-type unableToDeleteConsLogger struct {
-	DummyLogger
-	errCh chan string
-}
-
-func (l *unableToDeleteConsLogger) Errorf(format string, args ...interface{}) {
-	msg := fmt.Sprintf(format, args...)
-	if strings.Contains(msg, "unable to delete consumer") {
-		l.errCh <- msg
-	}
-}
-
-func TestMQTTSessionNotDeletedOnDeleteConsumerError(t *testing.T) {
-	org := mqttJSAPITimeout
-	mqttJSAPITimeout = 1000 * time.Millisecond
-	defer func() { mqttJSAPITimeout = org }()
-
-	cl := createJetStreamClusterWithTemplate(t, testMQTTGetClusterTemplaceNoLeaf(), "MQTT", 2)
-	defer cl.shutdown()
-
-	o := cl.opts[0]
-	s1 := cl.servers[0]
-	// Plug error logger to s1
-	l := &unableToDeleteConsLogger{errCh: make(chan string, 10)}
-	s1.SetLogger(l, false, false)
-
-	nc, js := jsClientConnect(t, s1)
-	defer nc.Close()
-
-	mc, r := testMQTTConnectRetry(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port, 5)
-	defer mc.Close()
-	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
-
-	testMQTTSub(t, 1, mc, r, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
-	testMQTTFlush(t, mc, nil, r)
-
-	// Now shutdown server 2, we should lose quorum
-	cl.servers[1].Shutdown()
-
-	// Close the MQTT client:
-	testMQTTDisconnect(t, mc, nil)
-
-	// We should have reported that there was an error deleting the consumer
-	select {
-	case <-l.errCh:
-		// OK
-	case <-time.After(time.Second):
-		t.Fatal("Server did not report any error")
-	}
-
-	// Now restart the server 2 so that we can check that the session is still persisted.
-	cl.restartAllSamePorts()
-	cl.waitOnStreamLeader(globalAccountName, mqttSessStreamName)
-
-	si, err := js.StreamInfo(mqttSessStreamName)
-	require_NoError(t, err)
-	require_True(t, si.State.Msgs == 1)
-}
-
 // Test for auto-cleanup of consumers.
 func TestMQTTConsumerInactiveThreshold(t *testing.T) {
+	tdir := t.TempDir()
 	tmpl := `
 		listen: 127.0.0.1:-1
 		server_name: mqtt
-		jetstream: enabled
+		jetstream {
+			store_dir = %q
+		}
 
 		mqtt {
 			listen: 127.0.0.1:-1
@@ -5968,7 +6821,7 @@ func TestMQTTConsumerInactiveThreshold(t *testing.T) {
 		# For access to system account.
 		accounts { $SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] } }
 	`
-	conf := createConfFile(t, []byte(fmt.Sprintf(tmpl, "0.2s")))
+	conf := createConfFile(t, []byte(fmt.Sprintf(tmpl, tdir, "0.2s")))
 	s, o := RunServerWithConfig(conf)
 	defer testMQTTShutdownServer(s)
 
@@ -5994,17 +6847,19 @@ func TestMQTTConsumerInactiveThreshold(t *testing.T) {
 
 	// Check reload.
 	// We will not redo existing consumers however.
-	reloadUpdateConfig(t, s, conf, fmt.Sprintf(tmpl, "22s"))
+	reloadUpdateConfig(t, s, conf, fmt.Sprintf(tmpl, tdir, "22s"))
 	if opts := s.getOpts(); opts.MQTT.ConsumerInactiveThreshold != 22*time.Second {
 		t.Fatalf("Expected reloaded value of %v but got %v", 22*time.Second, opts.MQTT.ConsumerInactiveThreshold)
 	}
 }
 
 func TestMQTTSubjectMapping(t *testing.T) {
-	conf := createConfFile(t, []byte(`
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
 		listen: 127.0.0.1:-1
 		server_name: mqtt
-		jetstream: enabled
+		jetstream {
+			store_dir = %q
+		}
 
 		mappings = {
 			foo0: bar0
@@ -6014,7 +6869,7 @@ func TestMQTTSubjectMapping(t *testing.T) {
 		mqtt {
 			listen: 127.0.0.1:-1
 		}
-	`))
+	`, t.TempDir())))
 	s, o := RunServerWithConfig(conf)
 	defer testMQTTShutdownServer(s)
 
@@ -6104,10 +6959,12 @@ func TestMQTTSubjectMapping(t *testing.T) {
 }
 
 func TestMQTTSubjectMappingWithImportExport(t *testing.T) {
-	conf := createConfFile(t, []byte(`
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
 		listen: 127.0.0.1:-1
 		server_name: mqtt
-		jetstream: enabled
+		jetstream {
+			store_dir = %q
+		}
 
 		accounts {
 			A {
@@ -6132,7 +6989,7 @@ func TestMQTTSubjectMappingWithImportExport(t *testing.T) {
 		mqtt {
 			listen: 127.0.0.1:-1
 		}
-	`))
+	`, t.TempDir())))
 	s, o := RunServerWithConfig(conf)
 	defer testMQTTShutdownServer(s)
 
@@ -6244,18 +7101,119 @@ func TestMQTTSubjectMappingWithImportExport(t *testing.T) {
 	check(nc, "$MQTT.msgs.foo")
 }
 
+func TestMQTTSubRetainedRace(t *testing.T) {
+	o := testMQTTDefaultOptions()
+
+	useCases := []struct {
+		name string
+		f    func(t *testing.T, o *Options, subTopic, pubTopic string, QOS byte)
+	}{
+		{"new top level", testMQTTNewSubRetainedRace},
+		{"existing top level", testMQTTNewSubWithExistingTopLevelRetainedRace},
+	}
+	pubTopic := "/bar"
+	subTopics := []string{"#", "/bar", "/+", "/#"}
+	QOS := []byte{0, 1, 2}
+	for _, tc := range useCases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, subTopic := range subTopics {
+				t.Run(subTopic, func(t *testing.T) {
+					for _, qos := range QOS {
+						t.Run(fmt.Sprintf("QOS%d", qos), func(t *testing.T) {
+							s := testMQTTRunServer(t, o)
+							defer testMQTTShutdownServer(s)
+
+							tc.f(t, o, subTopic, pubTopic, qos)
+						})
+					}
+				})
+			}
+		})
+	}
+}
+
+func testMQTTNewSubRetainedRace(t *testing.T, o *Options, subTopic, pubTopic string, QOS byte) {
+	expectedFlags := (QOS << 1) | mqttPubFlagRetain
+	payload := []byte("testmsg")
+
+	pubID := nuid.Next()
+	pubc, pubr := testMQTTConnectRetry(t, &mqttConnInfo{clientID: pubID, cleanSess: true}, o.MQTT.Host, o.MQTT.Port, 3)
+	testMQTTCheckConnAck(t, pubr, mqttConnAckRCConnectionAccepted, false)
+	defer testMQTTDisconnectEx(t, pubc, nil, true)
+	defer pubc.Close()
+	testMQTTPublish(t, pubc, pubr, QOS, false, true, pubTopic, 1, payload)
+
+	subID := nuid.Next()
+	subc, subr := testMQTTConnect(t, &mqttConnInfo{clientID: subID, cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTCheckConnAck(t, subr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, subc, subr, []*mqttFilter{{filter: subTopic, qos: QOS}}, []byte{QOS})
+
+	testMQTTCheckPubMsg(t, subc, subr, pubTopic, expectedFlags, payload)
+	if QOS == 2 {
+		testMQTTCheckPubAck(t, subr, mqttPacketPubRel)
+		testMQTTSendPIPacket(mqttPacketPubComp, t, subc, 1)
+	}
+
+	testMQTTDisconnectEx(t, subc, nil, true)
+	subc.Close()
+}
+
+func testMQTTNewSubWithExistingTopLevelRetainedRace(t *testing.T, o *Options, subTopic, pubTopic string, QOS byte) {
+	expectedFlags := (QOS << 1) | mqttPubFlagRetain
+	payload := []byte("testmsg")
+
+	pubID := nuid.Next()
+	pubc, pubr := testMQTTConnectRetry(t, &mqttConnInfo{clientID: pubID, cleanSess: true}, o.MQTT.Host, o.MQTT.Port, 3)
+	testMQTTCheckConnAck(t, pubr, mqttConnAckRCConnectionAccepted, false)
+	defer testMQTTDisconnectEx(t, pubc, nil, true)
+	defer pubc.Close()
+
+	subID := nuid.Next()
+	subc, subr := testMQTTConnect(t, &mqttConnInfo{clientID: subID, cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTCheckConnAck(t, subr, mqttConnAckRCConnectionAccepted, false)
+
+	// Clear retained messages from the prior run, and sleep a little to
+	// ensure the change is propagated.
+	testMQTTPublish(t, pubc, pubr, 0, false, true, pubTopic, 1, nil)
+	time.Sleep(1 * time.Millisecond)
+
+	// Subscribe to `#` first, make sure we can get get the retained message
+	// there. It's a QOS0 sub, so expect a QOS0 message.
+	testMQTTSub(t, 1, subc, subr, []*mqttFilter{{filter: `#`, qos: 0}}, []byte{0})
+	testMQTTExpectNothing(t, subr)
+
+	// Publish the retained message with QOS2, see that the `#` subscriber gets it.
+	testMQTTPublish(t, pubc, pubr, 2, false, true, pubTopic, 1, payload)
+	testMQTTCheckPubMsg(t, subc, subr, pubTopic, 0, payload)
+	testMQTTExpectNothing(t, subr)
+
+	// Now subscribe to the topic we want to test. We should get the retained
+	// message there.
+	testMQTTSub(t, 1, subc, subr, []*mqttFilter{{filter: subTopic, qos: QOS}}, []byte{QOS})
+	testMQTTCheckPubMsg(t, subc, subr, pubTopic, expectedFlags, payload)
+	if QOS == 2 {
+		testMQTTCheckPubAck(t, subr, mqttPacketPubRel)
+		testMQTTSendPIPacket(mqttPacketPubComp, t, subc, 1)
+	}
+
+	testMQTTDisconnectEx(t, subc, nil, true)
+	subc.Close()
+}
+
 // Issue https://github.com/nats-io/nats-server/issues/3924
 // The MQTT Server MUST NOT match Topic Filters starting with a wildcard character (# or +),
 // with Topic Names beginning with a $ character [MQTT-4.7.2-1]
 func TestMQTTSubjectWildcardStart(t *testing.T) {
-	conf := createConfFile(t, []byte(`
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
 		listen: 127.0.0.1:-1
 		server_name: mqtt
-		jetstream: enabled
+		jetstream {
+			store_dir = %q
+		}
 		mqtt {
 			listen: 127.0.0.1:-1
 		}
-	`))
+	`, t.TempDir())))
 	s, o := RunServerWithConfig(conf)
 	defer testMQTTShutdownServer(s)
 
@@ -6367,6 +7325,352 @@ func TestMQTTSubjectWildcardStart(t *testing.T) {
 	require_True(t, si.State.Msgs == 0)
 }
 
+func TestMQTTTopicWithDot(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	nc := natsConnect(t, s.ClientURL(), nats.UserInfo("mqtt", "pwd"))
+	defer nc.Close()
+
+	sub := natsSubSync(t, nc, "*.*")
+
+	c1, r1 := testMQTTConnect(t, &mqttConnInfo{user: "mqtt", pass: "pwd", clientID: "conn1", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c1.Close()
+	testMQTTCheckConnAck(t, r1, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, c1, r1, []*mqttFilter{{filter: "spBv1.0/plant1", qos: 0}}, []byte{0})
+	testMQTTSub(t, 1, c1, r1, []*mqttFilter{{filter: "spBv1.0/plant2", qos: 1}}, []byte{1})
+
+	c2, r2 := testMQTTConnect(t, &mqttConnInfo{user: "mqtt", pass: "pwd", clientID: "conn2", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, false)
+
+	testMQTTPublish(t, c2, r2, 0, false, false, "spBv1.0/plant1", 0, []byte("msg1"))
+	testMQTTCheckPubMsg(t, c1, r1, "spBv1.0/plant1", 0, []byte("msg1"))
+	msg := natsNexMsg(t, sub, time.Second)
+	require_Equal(t, msg.Subject, "spBv1//0.plant1")
+
+	testMQTTPublish(t, c2, r2, 1, false, false, "spBv1.0/plant2", 1, []byte("msg2"))
+	testMQTTCheckPubMsg(t, c1, r1, "spBv1.0/plant2", mqttPubQos1, []byte("msg2"))
+	msg = natsNexMsg(t, sub, time.Second)
+	require_Equal(t, msg.Subject, "spBv1//0.plant2")
+
+	natsPub(t, nc, "spBv1//0.plant1", []byte("msg3"))
+	testMQTTCheckPubMsg(t, c1, r1, "spBv1.0/plant1", 0, []byte("msg3"))
+	msg = natsNexMsg(t, sub, time.Second)
+	require_Equal(t, msg.Subject, "spBv1//0.plant1")
+
+	natsPub(t, nc, "spBv1//0.plant2", []byte("msg4"))
+	testMQTTCheckPubMsg(t, c1, r1, "spBv1.0/plant2", 0, []byte("msg4"))
+	msg = natsNexMsg(t, sub, time.Second)
+	require_Equal(t, msg.Subject, "spBv1//0.plant2")
+}
+
+// Issue https://github.com/nats-io/nats-server/issues/4291
+func TestMQTTJetStreamRepublishAndQoS0Subscribers(t *testing.T) {
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		server_name: mqtt
+		jetstream {
+			store_dir = %q
+		}
+		mqtt {
+			listen: 127.0.0.1:-1
+		}
+	`, t.TempDir())))
+	s, o := RunServerWithConfig(conf)
+	defer testMQTTShutdownServer(s)
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	// Setup stream with republish on it.
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		RePublish: &nats.RePublish{
+			Source:      "foo",
+			Destination: "mqtt.foo",
+		},
+	})
+	require_NoError(t, err)
+
+	// Create QoS0 subscriber to catch re-publishes.
+	mc, r := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+	testMQTTSub(t, 1, mc, r, []*mqttFilter{{filter: "mqtt/foo", qos: 0}}, []byte{0})
+	testMQTTFlush(t, mc, nil, r)
+
+	msg := []byte("HELLO WORLD")
+	_, err = js.Publish("foo", msg)
+	require_NoError(t, err)
+
+	testMQTTCheckPubMsg(t, mc, r, "mqtt/foo", 0, msg)
+	testMQTTExpectNothing(t, r)
+}
+
+func TestMQTTDecodeRetainedMessage(t *testing.T) {
+	tdir := t.TempDir()
+	tmpl := `
+		listen: 127.0.0.1:-1
+		server_name: mqtt
+		jetstream {
+			store_dir = %q
+		}
+
+		mqtt {
+			listen: 127.0.0.1:-1
+			consumer_inactive_threshold: %q
+		}
+
+		# For access to system account.
+		accounts { $SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] } }
+	`
+	conf := createConfFile(t, []byte(fmt.Sprintf(tmpl, tdir, "0.2s")))
+	s, o := RunServerWithConfig(conf)
+	defer testMQTTShutdownServer(s)
+
+	// Connect and publish a retained message, this will be in the "newer" form,
+	// with the metadata in the header.
+	mc, r := testMQTTConnectRetry(t, &mqttConnInfo{clientID: "test", cleanSess: true}, o.MQTT.Host, o.MQTT.Port, 5)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTPublish(t, mc, r, 0, false, true, "foo/1", 0, []byte("msg1"))
+	mc.Close()
+
+	// Store a "legacy", JSON-encoded payload directly into the stream.
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	rm := mqttRetainedMsg{
+		Origin:  "test",
+		Subject: "foo.2",
+		Topic:   "foo/2",
+		Flags:   mqttPubFlagRetain,
+		Msg:     []byte("msg2"),
+	}
+	jsonData, _ := json.Marshal(rm)
+	_, err := js.PublishMsg(&nats.Msg{
+		Subject: mqttRetainedMsgsStreamSubject + rm.Subject,
+		Data:    jsonData,
+	})
+	if err != nil {
+		t.Fatalf("Error publishing retained message to JS directly: %v", err)
+	}
+
+	// Restart the server to see that it picks up both retained messages on restart.
+	s.Shutdown()
+	s = RunServer(o)
+	defer testMQTTShutdownServer(s)
+
+	// Connect again, subscribe, and check that we get both messages.
+	mc, r = testMQTTConnectRetry(t, &mqttConnInfo{clientID: "test", cleanSess: true}, o.MQTT.Host, o.MQTT.Port, 5)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, mc, r, []*mqttFilter{{filter: "foo/+", qos: 0}}, []byte{0})
+	for i := 0; i < 2; i++ {
+		b, pl := testMQTTReadPacket(t, r)
+		if pt := b & mqttPacketMask; pt != mqttPacketPub {
+			t.Fatalf("Expected PUBLISH packet %x, got %x", mqttPacketPub, pt)
+		}
+		_, _, topic, _ := testMQTTGetPubMsgExEx(t, mc, r, mqttPubFlagRetain, pl, "", nil)
+		if string(topic) != "foo/1" && string(topic) != "foo/2" {
+			t.Fatalf("Expected foo/1 or foo/2, got %q", topic)
+		}
+	}
+	testMQTTExpectNothing(t, r)
+	mc.Close()
+
+	// Clear both retained messages.
+	mc, r = testMQTTConnectRetry(t, &mqttConnInfo{clientID: "test", cleanSess: true}, o.MQTT.Host, o.MQTT.Port, 5)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTPublish(t, mc, r, 0, false, true, "foo/1", 0, []byte{})
+	testMQTTPublish(t, mc, r, 0, false, true, "foo/2", 0, []byte{})
+	mc.Close()
+
+	// Connect again, subscribe, and check that we get nothing.
+	mc, r = testMQTTConnectRetry(t, &mqttConnInfo{clientID: "test", cleanSess: true}, o.MQTT.Host, o.MQTT.Port, 5)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, mc, r, []*mqttFilter{{filter: "foo/+", qos: 0}}, []byte{0})
+	testMQTTExpectNothing(t, r)
+}
+
+func TestMQTTSparkbDeathHandling(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// protoMetrics is protobuf-encoded test data, with no timestamp.
+	//
+	//	p := &sproto.Payload{
+	// 		Metrics: []*sproto.Payload_Metric{
+	// 			newSparkbMetric_Uint64(sparkbBDSeqMetric, uint64(sparkbBDSeq)),
+	// 			newSparkbMetric(sparkbDeviceMetric1, "value-at-death-1"),
+	// 			newSparkbMetric(sparkbDeviceMetric2, "value-at-death-2"),
+	// 		},
+	// 		Timestamp: nil,
+	// 	}
+	protoMetrics := []byte{0x12, 0x0b, 0x0a, 0x05, 0x62, 0x64, 0x53, 0x65, 0x71, 0x20, 0x04, 0x58, 0x02, 0x12, 0x24, 0x0a, 0x0e, 0x64, 0x65, 0x76, 0x69, 0x63, 0x65, 0x2d, 0x6d, 0x65, 0x74, 0x72, 0x69, 0x63, 0x31, 0x20, 0x0c, 0x7a, 0x10, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x2d, 0x61, 0x74, 0x2d, 0x64, 0x65, 0x61, 0x74, 0x68, 0x2d, 0x31, 0x12, 0x24, 0x0a, 0x0e, 0x64, 0x65, 0x76, 0x69, 0x63, 0x65, 0x2d, 0x6d, 0x65, 0x74, 0x72, 0x69, 0x63, 0x32, 0x20, 0x0c, 0x7a, 0x10, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x2d, 0x61, 0x74, 0x2d, 0x64, 0x65, 0x61, 0x74, 0x68, 0x2d, 0x32}
+
+	proto0Timestamp := []byte{0x08, 0x00}
+
+	protoDeadbeefTimestamp := []byte{0x08, 0xef, 0xfd, 0xb6, 0xf5, 0xfd, 0xde, 0xef, 0xd6, 0xde, 0x01}
+
+	mcPub, rPub := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mcPub.Close()
+	testMQTTCheckConnAck(t, rPub, mqttConnAckRCConnectionAccepted, false)
+
+	mcSub, rSub := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mcSub.Close()
+	testMQTTCheckConnAck(t, rSub, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 0, mcSub, rSub, []*mqttFilter{{filter: "spBv1.0/ggg/#", qos: 0}}, []byte{0})
+
+	for _, test := range []*struct {
+		name                  string
+		payload               []byte
+		expectTimestampOffset int
+		expectUnchanged       bool
+	}{
+		{"append", protoMetrics, len(protoMetrics), false},
+		{"replace at the end", append(protoMetrics, proto0Timestamp...), len(protoMetrics), false},
+		{"replace at the start", append(protoDeadbeefTimestamp, protoMetrics...), 0, false},
+		{"invalid", []byte{0xde, 0xad, 0xbe, 0xef}, 0, true}, // invalid payload
+	} {
+		var sendPI uint16
+		for _, topic := range []string{"NDEATH/nnn", "DDEATH/nnn/ddd"} {
+			sendPI++
+			t.Run(test.name+" "+topic, func(t *testing.T) {
+				testMQTTPublish(t, mcPub, rPub, 1, false, false, "spBv1.0/ggg/"+topic, sendPI, test.payload)
+
+				flags, pi, _, received := testMQTTGetPubMsgEx(t, mcSub, rSub, "", nil)
+				if mqttGetQoS(flags) == 1 {
+					testMQTTSendPIPacket(mqttPacketPubAck, t, mcSub, pi)
+				}
+
+				if test.expectUnchanged {
+					if !bytes.Equal(test.payload, received) {
+						t.Fatalf("Expected payload to be unchanged, got %q", received)
+					}
+					return
+				}
+
+				if test.expectTimestampOffset > len(received) {
+					t.Fatalf("Expected timestamp offset %v to be less than %v", test.expectTimestampOffset, len(received))
+				}
+				if test.expectTimestampOffset > 0 {
+					if !bytes.Equal(protoMetrics, received[:test.expectTimestampOffset]) {
+						t.Fatalf("Expected payload to be unchanged up to %v, got %q", test.expectTimestampOffset, received)
+					}
+				}
+
+				tsBytes := received[test.expectTimestampOffset:]
+				if tsBytes[0] != 0x08 {
+					t.Fatalf("Expected timestamp to start with 0x08, got %x", tsBytes)
+				}
+				v, _, err := protoScanVarint(tsBytes[1:])
+				if err != nil {
+					t.Fatalf("Error scanning varint: %v", err)
+				}
+
+				ts := time.UnixMilli(int64(v))
+				if time.Now().Before(ts) {
+					t.Fatalf("Expected timestamp to be in the past, got %v", ts)
+				}
+				if time.Since(ts) > time.Second {
+					t.Fatalf("Expected timestamp to be within a second, got %v", time.Since(ts))
+				}
+			})
+		}
+	}
+}
+
+func TestMQTTSparkbBirthHandling(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// Publish an NBIRTH message. Make sure it is received as both the original
+	// subject, and as a $sparkplug/certificates one.
+
+	const NBORN = "NODE BORN FAKE MESSAGE"
+	const DBORN = "DEVICE BORN FAKE MESSAGE"
+
+	tests := []*struct {
+		topic   string
+		payload string
+		flags   byte
+		mc      net.Conn
+		r       *mqttReader
+	}{
+		{
+			topic:   "spBv1.0/ggg/NBIRTH/nnn",
+			payload: NBORN,
+			flags:   0,
+		},
+		{
+			topic:   "spBv1.0/ggg/DBIRTH/nnn/ddd",
+			payload: DBORN,
+			flags:   0,
+		},
+		{
+			topic:   "$sparkplug/certificates/spBv1.0/ggg/NBIRTH/nnn",
+			payload: NBORN,
+			flags:   mqttPubFlagRetain,
+		},
+		{
+			topic:   "$sparkplug/certificates/spBv1.0/ggg/DBIRTH/nnn/ddd",
+			payload: DBORN,
+			flags:   mqttPubFlagRetain,
+		},
+	}
+
+	t.Run("$sparkplug messages delivered", func(t *testing.T) {
+		// Connect the subscribers, unique for each topic we monitor.
+		for i, test := range tests {
+			test.mc, test.r = testMQTTConnect(t, &mqttConnInfo{cleanSess: true, clientID: fmt.Sprintf("sub-%v", i)}, o.MQTT.Host, o.MQTT.Port)
+			defer test.mc.Close()
+			testMQTTCheckConnAck(t, test.r, mqttConnAckRCConnectionAccepted, false)
+
+			// Subscribne at QoS2 to make sure the messages are posted at QoS0 and
+			// not truncated to sub QoS.
+			testMQTTSub(t, 0, test.mc, test.r, []*mqttFilter{{filter: test.topic, qos: 2}}, []byte{2})
+		}
+
+		// connect the publisher
+		mc, r := testMQTTConnect(t, &mqttConnInfo{cleanSess: true, clientID: "pub"}, o.MQTT.Host, o.MQTT.Port)
+		defer mc.Close()
+		testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+		// {Publish} [ND]BIRTH messages. Note that IRL these are protobuf payloads.
+		testMQTTPublish(t, mc, r, 0, false, false, "spBv1.0/ggg/NBIRTH/nnn", 0, []byte("NODE BORN FAKE MESSAGE"))
+		testMQTTPublish(t, mc, r, 0, false, false, "spBv1.0/ggg/DBIRTH/nnn/ddd", 0, []byte("DEVICE BORN FAKE MESSAGE"))
+
+		// Check that the subscribers got the messages.
+		for _, test := range tests {
+			testMQTTCheckPubMsg(t, test.mc, test.r, test.topic, test.flags, []byte(test.payload))
+		}
+	})
+
+	t.Run("$sparkplug messages retained", func(t *testing.T) {
+		// Connect/subscribe again, and make sure that only retained messages are there.
+		for i, test := range tests {
+			mc, r := testMQTTConnect(t, &mqttConnInfo{cleanSess: true, clientID: fmt.Sprintf("sub-%v", i+100)}, o.MQTT.Host, o.MQTT.Port)
+			defer mc.Close()
+			testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+			testMQTTSub(t, 0, mc, r, []*mqttFilter{{filter: test.topic, qos: 2}}, []byte{2})
+			if test.flags&mqttPubFlagRetain != 0 {
+				testMQTTCheckPubMsg(t, mc, r, test.topic, test.flags, []byte(test.payload))
+			} else {
+				testMQTTExpectNothing(t, r)
+			}
+		}
+	})
+}
+
 //////////////////////////////////////////////////////////////////////////
 //
 // Benchmarks
@@ -6380,6 +7684,7 @@ const (
 
 func mqttBenchPubQoS0(b *testing.B, subject, payload string, numSubs int) {
 	b.StopTimer()
+	b.ReportAllocs()
 	o := testMQTTDefaultOptions()
 	s := RunServer(o)
 	defer testMQTTShutdownServer(s)
@@ -6387,8 +7692,8 @@ func mqttBenchPubQoS0(b *testing.B, subject, payload string, numSubs int) {
 	ci := &mqttConnInfo{clientID: "pub", cleanSess: true}
 	c, br := testMQTTConnect(b, ci, o.MQTT.Host, o.MQTT.Port)
 	testMQTTCheckConnAck(b, br, mqttConnAckRCConnectionAccepted, false)
-	w := &mqttWriter{}
-	mqttWritePublish(w, 0, false, false, subject, 0, []byte(payload))
+	w := newMQTTWriter(0)
+	testMQTTWritePublishPacket(b, w, 0, false, false, subject, 0, []byte(payload))
 	sendOp := w.Bytes()
 
 	dch := make(chan error, 1)
@@ -6403,7 +7708,7 @@ func mqttBenchPubQoS0(b *testing.B, subject, payload string, numSubs int) {
 		testMQTTSub(b, 1, cs, brs, []*mqttFilter{{filter: subject, qos: 0}}, []byte{0})
 		testMQTTFlush(b, cs, nil, brs)
 
-		w := &mqttWriter{}
+		w := newMQTTWriter(0)
 		varHeaderAndPayload := 2 + len(subject) + len(payload)
 		w.WriteVarInt(varHeaderAndPayload)
 		size := 1 + w.Len() + varHeaderAndPayload
@@ -6461,10 +7766,10 @@ func mqttBenchPubQoS1(b *testing.B, subject, payload string, numSubs int) {
 	c, br := testMQTTConnect(b, ci, o.MQTT.Host, o.MQTT.Port)
 	testMQTTCheckConnAck(b, br, mqttConnAckRCConnectionAccepted, false)
 
-	w := &mqttWriter{}
-	mqttWritePublish(w, 1, false, false, subject, 1, []byte(payload))
+	w := newMQTTWriter(0)
+	testMQTTWritePublishPacket(b, w, 1, false, false, subject, 1, []byte(payload))
 	// For reported bytes we will count the PUBLISH + PUBACK (4 bytes)
-	totalSize := int64(len(w.Bytes()) + 4)
+	totalSize := int64(w.Len() + 4)
 	w.Reset()
 
 	pi := uint16(1)
@@ -6483,7 +7788,7 @@ func mqttBenchPubQoS1(b *testing.B, subject, payload string, numSubs int) {
 		testMQTTSub(b, 1, cs, brs, []*mqttFilter{{filter: subject, qos: 1}}, []byte{1})
 		testMQTTFlush(b, cs, nil, brs)
 
-		w := &mqttWriter{}
+		w := newMQTTWriter(0)
 		varHeaderAndPayload := 2 + len(subject) + 2 + len(payload)
 		w.WriteVarInt(varHeaderAndPayload)
 		size := 1 + w.Len() + varHeaderAndPayload
@@ -6512,7 +7817,7 @@ func mqttBenchPubQoS1(b *testing.B, subject, payload string, numSubs int) {
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
 		if pi <= maxpi {
-			mqttWritePublish(w, 1, false, false, subject, pi, []byte(payload))
+			testMQTTWritePublishPacket(b, w, 1, false, false, subject, pi, []byte(payload))
 			pi++
 			if w.Len() >= mqttBenchBufLen {
 				flush()

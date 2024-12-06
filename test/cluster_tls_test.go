@@ -72,7 +72,7 @@ type captureTLSError struct {
 	ch chan struct{}
 }
 
-func (c *captureTLSError) Errorf(format string, v ...interface{}) {
+func (c *captureTLSError) Errorf(format string, v ...any) {
 	msg := fmt.Sprintf(format, v...)
 	if strings.Contains(msg, "handshake error") {
 		select {
@@ -87,7 +87,7 @@ type captureClusterTLSInsecureLogger struct {
 	ch chan struct{}
 }
 
-func (c *captureClusterTLSInsecureLogger) Warnf(format string, v ...interface{}) {
+func (c *captureClusterTLSInsecureLogger) Warnf(format string, v ...any) {
 	msg := fmt.Sprintf(format, v...)
 	if strings.Contains(msg, "solicited routes will not be verified") {
 		select {
@@ -103,6 +103,8 @@ func TestClusterTLSInsecure(t *testing.T) {
 		cluster {
 			name: "xyz"
 			listen: "127.0.0.1:-1"
+			pool_size: -1
+			compression: "disabled"
 			tls {
 			    cert_file: "./configs/certs/server-noip.pem"
 				key_file:  "./configs/certs/server-key-noip.pem"
@@ -122,6 +124,8 @@ func TestClusterTLSInsecure(t *testing.T) {
 		cluster {
 			name: "xyz"
 			listen: "127.0.0.1:-1"
+			pool_size: -1
+			compression: "disabled"
 			tls {
 			    cert_file: "./configs/certs/server-noip.pem"
 				key_file:  "./configs/certs/server-key-noip.pem"

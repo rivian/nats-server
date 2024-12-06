@@ -44,7 +44,7 @@ func TestSignalToReOpenLogFile(t *testing.T) {
 	defer s.Shutdown()
 
 	// Set the file log
-	fileLog := logger.NewFileLogger(s.opts.LogFile, s.opts.Logtime, s.opts.Debug, s.opts.Trace, true)
+	fileLog := logger.NewFileLogger(s.opts.LogFile, s.opts.Logtime, s.opts.Debug, s.opts.Trace, true, logger.LogUTC(s.opts.LogtimeUTC))
 	s.SetLogger(fileLog, false, false)
 
 	// Add a trace
@@ -76,7 +76,14 @@ func TestSignalToReOpenLogFile(t *testing.T) {
 }
 
 func TestSignalToReloadConfig(t *testing.T) {
-	opts, err := ProcessConfigFile("./configs/reload/basic.conf")
+	tmpl := `
+		listen: 127.0.0.1:-1
+		accounts: {
+			A: { users: [ { user: %s, password: foo } ] }
+		}
+	`
+	conf := createConfFile(t, []byte(fmt.Sprintf(tmpl, "foo")))
+	opts, err := ProcessConfigFile(conf)
 	if err != nil {
 		t.Fatalf("Error processing config file: %v", err)
 	}
@@ -84,10 +91,21 @@ func TestSignalToReloadConfig(t *testing.T) {
 	s := RunServer(opts)
 	defer s.Shutdown()
 
+	// Check that the reload time does not change when there are no changes.
+	loaded := s.ConfigTime()
+	time.Sleep(500 * time.Millisecond)
+	syscall.Kill(syscall.Getpid(), syscall.SIGHUP)
+	if reloaded := s.ConfigTime(); reloaded.After(loaded) {
+		t.Fatalf("ConfigTime is incorrect.\nexpected no change: %s\ngot: %s", loaded, reloaded)
+	}
+
 	// Repeat test to make sure that server services signals more than once...
 	for i := 0; i < 2; i++ {
 		loaded := s.ConfigTime()
-
+		user := fmt.Sprintf("foo:%d", i)
+		if err := os.WriteFile(conf, []byte(fmt.Sprintf(tmpl, user)), 0666); err != nil {
+			t.Fatalf("Error creating config file: %v", err)
+		}
 		// Wait a bit to ensure ConfigTime changes.
 		time.Sleep(5 * time.Millisecond)
 
@@ -139,6 +157,48 @@ func TestProcessSignalMultipleProcesses(t *testing.T) {
 	if err.Error() != expectedStr {
 		t.Fatalf("Error is incorrect.\nexpected: %s\ngot: %s", expectedStr, err.Error())
 	}
+}
+
+func TestProcessSignalMultipleProcessesGlob(t *testing.T) {
+	pid := os.Getpid()
+	pgrepBefore := pgrep
+	pgrep = func() ([]byte, error) {
+		return []byte(fmt.Sprintf("123\n456\n%d\n", pid)), nil
+	}
+	defer func() {
+		pgrep = pgrepBefore
+	}()
+
+	err := ProcessSignal(CommandStop, "*")
+	if err == nil {
+		t.Fatal("Expected error")
+	}
+	lines := strings.Split(err.Error(), "\n")
+	require_Len(t, len(lines), 3)
+	require_Equal(t, lines[0], "") // Empty line comes first
+	require_True(t, strings.HasPrefix(lines[1], "signal \"stop\" 123:"))
+	require_True(t, strings.HasPrefix(lines[2], "signal \"stop\" 456:"))
+}
+
+func TestProcessSignalMultipleProcessesGlobPartial(t *testing.T) {
+	pid := os.Getpid()
+	pgrepBefore := pgrep
+	pgrep = func() ([]byte, error) {
+		return []byte(fmt.Sprintf("123\n124\n456\n%d\n", pid)), nil
+	}
+	defer func() {
+		pgrep = pgrepBefore
+	}()
+
+	err := ProcessSignal(CommandStop, "12*")
+	if err == nil {
+		t.Fatal("Expected error")
+	}
+	lines := strings.Split(err.Error(), "\n")
+	require_Len(t, len(lines), 3)
+	require_Equal(t, lines[0], "") // Empty line comes first
+	require_True(t, strings.HasPrefix(lines[1], "signal \"stop\" 123:"))
+	require_True(t, strings.HasPrefix(lines[2], "signal \"stop\" 124:"))
 }
 
 func TestProcessSignalPgrepError(t *testing.T) {

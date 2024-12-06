@@ -14,11 +14,12 @@
 package server
 
 import (
-	"bytes"
+	"cmp"
 	"fmt"
 	"math/rand"
 	"net/url"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +33,7 @@ var DefaultTestOptions = Options{
 	NoSigs:                true,
 	MaxControlLine:        4096,
 	DisableShortFirstPing: true,
+	JetStreamStrict:       true,
 }
 
 func testDefaultClusterOptionsForLeafNodes() *Options {
@@ -46,20 +48,21 @@ func testDefaultClusterOptionsForLeafNodes() *Options {
 	return &o
 }
 
-func RunRandClientPortServer() *Server {
+func RunRandClientPortServer(t *testing.T) *Server {
 	opts := DefaultTestOptions
 	opts.Port = -1
+	opts.StoreDir = t.TempDir()
 	return RunServer(&opts)
 }
 
-func require_True(t *testing.T, b bool) {
+func require_True(t testing.TB, b bool) {
 	t.Helper()
 	if !b {
 		t.Fatalf("require true, but got false")
 	}
 }
 
-func require_False(t *testing.T, b bool) {
+func require_False(t testing.TB, b bool) {
 	t.Helper()
 	if b {
 		t.Fatalf("require false, but got true")
@@ -73,10 +76,15 @@ func require_NoError(t testing.TB, err error) {
 	}
 }
 
-func require_NotNil(t testing.TB, v any) {
+func require_NotNil[T any](t testing.TB, v T) {
 	t.Helper()
-	if v == nil {
-		t.Fatalf("require not nil, but got: %v", v)
+	r := reflect.ValueOf(v)
+	switch k := r.Kind(); k {
+	case reflect.Ptr, reflect.Interface, reflect.Slice,
+		reflect.Map, reflect.Chan, reflect.Func:
+		if r.IsNil() {
+			t.Fatalf("require not nil, but got nil")
+		}
 	}
 }
 
@@ -89,7 +97,7 @@ func require_Contains(t *testing.T, s string, subStrs ...string) {
 	}
 }
 
-func require_Error(t *testing.T, err error, expected ...error) {
+func require_Error(t testing.TB, err error, expected ...error) {
 	t.Helper()
 	if err == nil {
 		t.Fatalf("require error, but got none")
@@ -112,24 +120,51 @@ func require_Error(t *testing.T, err error, expected ...error) {
 	t.Fatalf("Expected one of %v, got '%v'", expected, err)
 }
 
-func require_Equal(t *testing.T, a, b string) {
+func require_Equal[T comparable](t testing.TB, a, b T) {
 	t.Helper()
-	if strings.Compare(a, b) != 0 {
-		t.Fatalf("require equal, but got: %v != %v", a, b)
+	if a != b {
+		t.Fatalf("require %T equal, but got: %v != %v", a, a, b)
 	}
 }
 
-func require_NotEqual(t *testing.T, a, b [32]byte) {
+func require_NotEqual[T comparable](t testing.TB, a, b T) {
 	t.Helper()
-	if bytes.Equal(a[:], b[:]) {
-		t.Fatalf("require not equal, but got: %v != %v", a, b)
+	if a == b {
+		t.Fatalf("require %T not equal, but got: %v == %v", a, a, b)
 	}
 }
 
-func require_Len(t *testing.T, a, b int) {
+func require_Len(t testing.TB, a, b int) {
 	t.Helper()
 	if a != b {
 		t.Fatalf("require len, but got: %v != %v", a, b)
+	}
+}
+
+func require_LessThan[T cmp.Ordered](t *testing.T, a, b T) {
+	t.Helper()
+	if a >= b {
+		t.Fatalf("require %v to be less than %v", a, b)
+	}
+}
+
+func require_ChanRead[T any](t *testing.T, ch chan T, timeout time.Duration) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(timeout):
+		t.Fatalf("require read from channel within %v but didn't get anything", timeout)
+	}
+	panic("this shouldn't be possible")
+}
+
+func require_NoChanRead[T any](t *testing.T, ch chan T, timeout time.Duration) {
+	t.Helper()
+	select {
+	case <-ch:
+		t.Fatalf("require no read from channel within %v but got something", timeout)
+	case <-time.After(timeout):
 	}
 }
 
@@ -276,6 +311,7 @@ func (c *cluster) shutdown() {
 	for i, s := range c.servers {
 		sd := s.StoreDir()
 		s.Shutdown()
+		s.WaitForShutdown()
 		if cf := c.opts[i].ConfigFile; cf != _EMPTY_ {
 			os.Remove(cf)
 		}

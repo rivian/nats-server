@@ -1,6 +1,6 @@
 [Unit]
 Description=NATS Server
-After=network.target ntp.service
+After=network-online.target ntp.service
 
 [Service]
 PrivateTmp=true
@@ -10,6 +10,9 @@ ExecReload=/bin/kill -s HUP $MAINPID
 ExecStop=/bin/kill -s SIGINT $MAINPID
 User=nats
 Group=nats
+# The nats-server uses SIGUSR2 to trigger using Lame Duck Mode (LDM) shutdown
+KillSignal=SIGUSR2
+# You might want to adjust TimeoutStopSec too.
 
 [Install]
 WantedBy=multi-user.target

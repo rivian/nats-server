@@ -1,4 +1,4 @@
-// Copyright 2020-2022 The NATS Authors
+// Copyright 2020-2024 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -213,6 +213,7 @@ func TestJetStreamSuperClusterUniquePlacementTag(t *testing.T) {
 			si, err := js.AddStream(cfg)
 			require_NoError(t, err)
 			require_Equal(t, si.Cluster.Name, "C2")
+			s.waitOnStreamLeader(globalAccountName, cfg.Name)
 			cfg.Replicas = 2
 			si, err = js.UpdateStream(cfg)
 			require_NoError(t, err)
@@ -550,7 +551,7 @@ func TestJetStreamSuperClusterConnectionCount(t *testing.T) {
 		require_NoError(t, err)
 		_, err = js.AddStream(&nats.StreamConfig{
 			Name:     "src",
-			Sources:  []*nats.StreamSource{{Name: "foo.1"}, {Name: "foo.2"}},
+			Sources:  []*nats.StreamSource{{Name: "foo1"}, {Name: "foo2"}},
 			Replicas: 3})
 		require_NoError(t, err)
 	}()
@@ -561,7 +562,7 @@ func TestJetStreamSuperClusterConnectionCount(t *testing.T) {
 		require_NoError(t, err)
 		_, err = js.AddStream(&nats.StreamConfig{
 			Name:     "mir",
-			Mirror:   &nats.StreamSource{Name: "foo.2"},
+			Mirror:   &nats.StreamSource{Name: "foo2"},
 			Replicas: 3})
 		require_NoError(t, err)
 	}()
@@ -659,7 +660,7 @@ func TestJetStreamSuperClusterConsumersBrokenGateways(t *testing.T) {
 	}
 
 	// Make sure we can deal with data loss at the end.
-	checkFor(t, 10*time.Second, 250*time.Millisecond, func() error {
+	checkFor(t, 20*time.Second, 250*time.Millisecond, func() error {
 		si, err := js.StreamInfo("S")
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
@@ -916,7 +917,7 @@ func TestJetStreamSuperClusterGetNextRewrite(t *testing.T) {
 	defer ln.Shutdown()
 
 	c2 := sc.clusterForName("C2")
-	nc, js := jsClientConnectEx(t, c2.randomServer(), "C", nats.UserInfo("nojs", "p"))
+	nc, js := jsClientConnectEx(t, c2.randomServer(), []nats.JSOpt{nats.Domain("C")}, nats.UserInfo("nojs", "p"))
 	defer nc.Close()
 
 	// Create a stream and add messages.
@@ -1079,7 +1080,7 @@ func TestJetStreamSuperClusterGetNextSubRace(t *testing.T) {
 		t.Fatalf("Both servers in C2 had an inbound GW connection!")
 	}
 
-	nc, js := jsClientConnectEx(t, c2Srv, "C", nats.UserInfo("nojs", "p"))
+	nc, js := jsClientConnectEx(t, c2Srv, []nats.JSOpt{nats.Domain("C")}, nats.UserInfo("nojs", "p"))
 	defer nc.Close()
 
 	_, err := js.AddStream(&nats.StreamConfig{Name: "foo"})
@@ -1788,8 +1789,8 @@ func TestJetStreamSuperClusterMovingStreamsAndConsumers(t *testing.T) {
 			})
 			require_Contains(t, err.Error(), "stream move already in progress")
 
-			checkFor(t, 10*time.Second, 10*time.Millisecond, func() error {
-				si, err := js.StreamInfo("MOVE")
+			checkFor(t, 10*time.Second, 200*time.Millisecond, func() error {
+				si, err := js.StreamInfo("MOVE", nats.MaxWait(500*time.Millisecond))
 				if err != nil {
 					return err
 				}
@@ -1811,8 +1812,8 @@ func TestJetStreamSuperClusterMovingStreamsAndConsumers(t *testing.T) {
 			// Expect a new leader to emerge and replicas to drop as a leader is elected.
 			// We have to check fast or it might complete and we will not see intermediate steps.
 			sc.waitOnStreamLeader("$G", "MOVE")
-			checkFor(t, 10*time.Second, 10*time.Millisecond, func() error {
-				si, err := js.StreamInfo("MOVE")
+			checkFor(t, 10*time.Second, 200*time.Millisecond, func() error {
+				si, err := js.StreamInfo("MOVE", nats.MaxWait(500*time.Millisecond))
 				if err != nil {
 					return err
 				}
@@ -1824,8 +1825,8 @@ func TestJetStreamSuperClusterMovingStreamsAndConsumers(t *testing.T) {
 
 			// Should see the cluster designation and leader switch to C2.
 			// We should also shrink back down to original replica count.
-			checkFor(t, 20*time.Second, 100*time.Millisecond, func() error {
-				si, err := js.StreamInfo("MOVE")
+			checkFor(t, 20*time.Second, 200*time.Millisecond, func() error {
+				si, err := js.StreamInfo("MOVE", nats.MaxWait(500*time.Millisecond))
 				if err != nil {
 					return err
 				}
@@ -1996,7 +1997,7 @@ func TestJetStreamSuperClusterMovingStreamsWithMirror(t *testing.T) {
 	}()
 
 	// Let it get going.
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(1500 * time.Millisecond)
 
 	// Now move the source to a new cluster.
 	_, err = js.UpdateStream(&nats.StreamConfig{
@@ -2122,12 +2123,16 @@ func TestJetStreamSuperClusterMovingStreamAndMoveBack(t *testing.T) {
 
 			checkMove("C2")
 
-			_, err = js.UpdateStream(&nats.StreamConfig{
-				Name:      "TEST",
-				Replicas:  test.replicas,
-				Placement: &nats.Placement{Tags: []string{"cloud:aws"}},
+			// The move could be completed when looking at the stream info, but the meta leader could still
+			// deny move updates for a short time while state is cleaned up.
+			checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+				_, err = js.UpdateStream(&nats.StreamConfig{
+					Name:      "TEST",
+					Replicas:  test.replicas,
+					Placement: &nats.Placement{Tags: []string{"cloud:aws"}},
+				})
+				return err
 			})
-			require_NoError(t, err)
 
 			checkMove("C1")
 		})
@@ -2531,7 +2536,7 @@ func TestJetStreamSuperClusterStateOnRestartPreventsConsumerRecovery(t *testing.
 		require_NoError(t, err)
 	}
 	sub := natsSubSync(t, nc, "d")
-	natsNexMsg(t, sub, time.Second)
+	natsNexMsg(t, sub, 5*time.Second)
 
 	c := sc.clusterForName("C2")
 	cl := c.consumerLeader("$G", "DS", "dlc")
@@ -2701,10 +2706,17 @@ func TestJetStreamSuperClusterTagInducedMoveCancel(t *testing.T) {
 	_, err = js.UpdateStream(cfg)
 	require_NoError(t, err)
 
-	rmsg, err := ncsys.Request(fmt.Sprintf(JSApiServerStreamCancelMoveT, "$G", "TEST"), nil, 5*time.Second)
-	require_NoError(t, err)
+	// Retry in case stream is still being created and without a leader we won't receive a response
 	var cancelResp JSApiStreamUpdateResponse
-	require_NoError(t, json.Unmarshal(rmsg.Data, &cancelResp))
+	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+		rmsg, err := ncsys.Request(fmt.Sprintf(JSApiServerStreamCancelMoveT, "$G", "TEST"), nil, 1*time.Second)
+		if errors.Is(err, nats.ErrTimeout) {
+			return err
+		}
+		require_NoError(t, err)
+		require_NoError(t, json.Unmarshal(rmsg.Data, &cancelResp))
+		return nil
+	})
 	if cancelResp.Error != nil && ErrorIdentifier(cancelResp.Error.ErrCode) == JSStreamMoveNotInProgress {
 		t.Skip("This can happen with delays, when Move completed before Cancel", cancelResp.Error)
 		return
@@ -3182,7 +3194,7 @@ func TestJetStreamSuperClusterPeerEvacuationAndStreamReassignment(t *testing.T) 
 			})
 		}
 		// Now wait until the stream is now current.
-		checkFor(t, 50*time.Second, 100*time.Millisecond, func() error {
+		checkFor(t, 20*time.Second, 100*time.Millisecond, func() error {
 			si, err := js.StreamInfo("TEST", nats.MaxWait(time.Second))
 			if err != nil {
 				return fmt.Errorf("could not fetch stream info: %v", err)
@@ -3216,7 +3228,7 @@ func TestJetStreamSuperClusterPeerEvacuationAndStreamReassignment(t *testing.T) 
 		checkFor(t, 20*time.Second, time.Second, func() error {
 			if !listFrom {
 				// when needed determine which server move moved away from
-				si, err := js.StreamInfo("TEST", nats.MaxWait(2*time.Second))
+				si, err := js.StreamInfo("TEST", nats.MaxWait(time.Second))
 				if err != nil {
 					return fmt.Errorf("could not fetch stream info: %v", err)
 				}
@@ -3361,13 +3373,13 @@ func TestJetStreamSuperClusterSystemLimitsPlacement(t *testing.T) {
 	defer sCluster.shutdown()
 
 	requestLeaderStepDown := func(clientURL string) error {
-		nc, err := nats.Connect(clientURL)
+		nc, err := nats.Connect(clientURL, nats.UserInfo("admin", "s3cr3t!"))
 		if err != nil {
 			return err
 		}
 		defer nc.Close()
 
-		ncResp, err := nc.Request(JSApiLeaderStepDown, nil, 3*time.Second)
+		ncResp, err := nc.Request(JSApiLeaderStepDown, nil, time.Second)
 		if err != nil {
 			return err
 		}
@@ -3767,7 +3779,7 @@ type captureGWRewriteLogger struct {
 	ch chan string
 }
 
-func (l *captureGWRewriteLogger) Tracef(format string, args ...interface{}) {
+func (l *captureGWRewriteLogger) Tracef(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 	if strings.Contains(msg, "$JS.SNAPSHOT.ACK.TEST") && strings.Contains(msg, gwReplyPrefix) {
 		select {
@@ -3952,4 +3964,182 @@ func TestJetStreamSuperClusterGWOfflineSatus(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+func TestJetStreamSuperClusterMovingR1Stream(t *testing.T) {
+	// Make C2 have some latency.
+	gwm := gwProxyMap{
+		"C2": &gwProxy{
+			rtt:  10 * time.Millisecond,
+			up:   1 * 1024 * 1024 * 1024, // 1gbit
+			down: 1 * 1024 * 1024 * 1024, // 1gbit
+		},
+	}
+	sc := createJetStreamTaggedSuperClusterWithGWProxy(t, gwm)
+	defer sc.shutdown()
+
+	nc, js := jsClientConnect(t, sc.clusterForName("C1").randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name: "TEST",
+	})
+	require_NoError(t, err)
+
+	toSend := 10_000
+	for i := 0; i < toSend; i++ {
+		_, err := js.PublishAsync("TEST", []byte("HELLO WORLD"))
+		require_NoError(t, err)
+	}
+	select {
+	case <-js.PublishAsyncComplete():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Did not receive completion signal")
+	}
+
+	// Have it move to GCP.
+	_, err = js.UpdateStream(&nats.StreamConfig{
+		Name:      "TEST",
+		Placement: &nats.Placement{Tags: []string{"cloud:gcp"}},
+	})
+	require_NoError(t, err)
+
+	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+		sc.waitOnStreamLeader(globalAccountName, "TEST")
+		si, err := js.StreamInfo("TEST")
+		if err != nil {
+			return err
+		}
+		if si.Cluster.Name != "C2" {
+			return fmt.Errorf("Wrong cluster: %q", si.Cluster.Name)
+		}
+		if si.Cluster.Leader == _EMPTY_ {
+			return fmt.Errorf("No leader yet")
+		} else if !strings.HasPrefix(si.Cluster.Leader, "C2") {
+			return fmt.Errorf("Wrong leader: %q", si.Cluster.Leader)
+		}
+		// Now we want to see that we shrink back to original.
+		if len(si.Cluster.Replicas) != 0 {
+			return fmt.Errorf("Expected 0 replicas, got %d", len(si.Cluster.Replicas))
+		}
+		if si.State.Msgs != uint64(toSend) {
+			return fmt.Errorf("Only see %d msgs", si.State.Msgs)
+		}
+		return nil
+	})
+}
+
+// https://github.com/nats-io/nats-server/issues/4396
+func TestJetStreamSuperClusterR1StreamPeerRemove(t *testing.T) {
+	sc := createJetStreamSuperCluster(t, 1, 3)
+	defer sc.shutdown()
+
+	nc, js := jsClientConnect(t, sc.serverByName("C1-S1"))
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 1,
+	})
+	require_NoError(t, err)
+
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+
+	// Call peer remove on the only peer the leader.
+	resp, err := nc.Request(fmt.Sprintf(JSApiStreamRemovePeerT, "TEST"), []byte(`{"peer":"`+si.Cluster.Leader+`"}`), time.Second)
+	require_NoError(t, err)
+	var rpr JSApiStreamRemovePeerResponse
+	require_NoError(t, json.Unmarshal(resp.Data, &rpr))
+	require_False(t, rpr.Success)
+	require_True(t, rpr.Error.ErrCode == 10075)
+
+	// Stream should still be in place and useable.
+	_, err = js.StreamInfo("TEST")
+	require_NoError(t, err)
+}
+
+func TestJetStreamSuperClusterConsumerPauseAdvisories(t *testing.T) {
+	sc := createJetStreamSuperCluster(t, 3, 3)
+	defer sc.shutdown()
+
+	nc, js := jsClientConnect(t, sc.randomServer())
+	defer nc.Close()
+
+	pauseReq := func(consumer string, deadline time.Time) time.Time {
+		j, err := json.Marshal(JSApiConsumerPauseRequest{
+			PauseUntil: deadline,
+		})
+		require_NoError(t, err)
+		msg, err := nc.Request(fmt.Sprintf(JSApiConsumerPauseT, "TEST", consumer), j, time.Second)
+		require_NoError(t, err)
+		var res JSApiConsumerPauseResponse
+		err = json.Unmarshal(msg.Data, &res)
+		require_NoError(t, err)
+		return res.PauseUntil
+	}
+
+	checkAdvisory := func(msg *nats.Msg, shouldBePaused bool, deadline time.Time) {
+		t.Helper()
+		var advisory JSConsumerPauseAdvisory
+		require_NoError(t, json.Unmarshal(msg.Data, &advisory))
+		require_Equal(t, advisory.Stream, "TEST")
+		require_Equal(t, advisory.Consumer, "my_consumer")
+		require_Equal(t, advisory.Paused, shouldBePaused)
+		require_True(t, advisory.PauseUntil.Equal(deadline))
+	}
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	ch := make(chan *nats.Msg, 10)
+	_, err = nc.ChanSubscribe(JSAdvisoryConsumerPausePre+".TEST.my_consumer", ch)
+	require_NoError(t, err)
+
+	deadline := time.Now().Add(time.Second)
+	jsTestPause_CreateOrUpdateConsumer(t, nc, ActionCreate, "TEST", ConsumerConfig{
+		Name:       "my_consumer",
+		PauseUntil: &deadline,
+		Replicas:   3,
+	})
+
+	// First advisory should tell us that the consumer was paused
+	// on creation.
+	msg := require_ChanRead(t, ch, time.Second*2)
+	checkAdvisory(msg, true, deadline)
+	require_Len(t, len(ch), 0) // Should only receive one advisory.
+
+	// The second one for the unpause.
+	msg = require_ChanRead(t, ch, time.Second*2)
+	checkAdvisory(msg, false, deadline)
+	require_Len(t, len(ch), 0) // Should only receive one advisory.
+
+	// Now we'll pause the consumer for a second using the API.
+	deadline = time.Now().Add(time.Second)
+	require_True(t, pauseReq("my_consumer", deadline).Equal(deadline))
+
+	// Third advisory should tell us about the pause via the API.
+	msg = require_ChanRead(t, ch, time.Second*2)
+	checkAdvisory(msg, true, deadline)
+	require_Len(t, len(ch), 0) // Should only receive one advisory.
+
+	// Finally that should unpause.
+	msg = require_ChanRead(t, ch, time.Second*2)
+	checkAdvisory(msg, false, deadline)
+	require_Len(t, len(ch), 0) // Should only receive one advisory.
+
+	// Now we're going to set the deadline into the future so we can
+	// see what happens when we kick leaders or restart.
+	deadline = time.Now().Add(time.Hour)
+	require_True(t, pauseReq("my_consumer", deadline).Equal(deadline))
+
+	// Setting the deadline should have generated an advisory.
+	msg = require_ChanRead(t, ch, time.Second*2)
+	checkAdvisory(msg, true, deadline)
+	require_Len(t, len(ch), 0) // Should only receive one advisory.
 }

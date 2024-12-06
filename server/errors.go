@@ -60,6 +60,9 @@ var (
 	// connections.
 	ErrTooManyAccountConnections = errors.New("maximum account active connections exceeded")
 
+	// ErrLeafNodeLoop signals a leafnode is trying to register for a cluster we already have registered.
+	ErrLeafNodeLoop = errors.New("leafnode loop detected")
+
 	// ErrTooManySubs signals a client that the maximum number of subscriptions per connection
 	// has been reached.
 	ErrTooManySubs = errors.New("maximum subscriptions exceeded")
@@ -150,6 +153,9 @@ var (
 	// Gateway's name.
 	ErrWrongGateway = errors.New("wrong gateway")
 
+	// ErrGatewayNameHasSpaces signals that the gateway name contains spaces, which is not allowed.
+	ErrGatewayNameHasSpaces = errors.New("gateway name cannot contain spaces")
+
 	// ErrNoSysAccount is returned when an attempt to publish or subscribe is made
 	// when there is no internal system account defined.
 	ErrNoSysAccount = errors.New("system account not setup")
@@ -159,6 +165,9 @@ var (
 
 	// ErrServerNotRunning is used to signal an error that a server is not running.
 	ErrServerNotRunning = errors.New("server is not running")
+
+	// ErrServerNameHasSpaces signals that the server name contains spaces, which is not allowed.
+	ErrServerNameHasSpaces = errors.New("server name cannot contain spaces")
 
 	// ErrBadMsgHeader signals the parser detected a bad message header
 	ErrBadMsgHeader = errors.New("bad message header detected")
@@ -176,6 +185,9 @@ var (
 
 	// ErrClusterNameRemoteConflict signals that a remote server has a different cluster name.
 	ErrClusterNameRemoteConflict = errors.New("cluster name from remote server conflicts")
+
+	// ErrClusterNameHasSpaces signals that the cluster name contains spaces, which is not allowed.
+	ErrClusterNameHasSpaces = errors.New("cluster name cannot contain spaces")
 
 	// ErrMalformedSubject is returned when a subscription is made with a subject that does not conform to subject rules.
 	ErrMalformedSubject = errors.New("malformed subject")
@@ -200,7 +212,7 @@ var (
 	ErrInvalidMappingDestination = errors.New("invalid mapping destination")
 
 	// ErrInvalidMappingDestinationSubject is used to error on a bad transform destination mapping
-	ErrInvalidMappingDestinationSubject = fmt.Errorf("%w: invalid subject", ErrInvalidMappingDestination)
+	ErrInvalidMappingDestinationSubject = fmt.Errorf("%w: invalid transform", ErrInvalidMappingDestination)
 
 	// ErrMappingDestinationNotUsingAllWildcards is used to error on a transform destination not using all of the token wildcards
 	ErrMappingDestinationNotUsingAllWildcards = fmt.Errorf("%w: not using all of the token wildcard(s)", ErrInvalidMappingDestination)
@@ -208,17 +220,20 @@ var (
 	// ErrUnknownMappingDestinationFunction is returned when a subject mapping destination contains an unknown mustache-escaped mapping function.
 	ErrUnknownMappingDestinationFunction = fmt.Errorf("%w: unknown function", ErrInvalidMappingDestination)
 
-	// ErrorMappingDestinationFunctionWildcardIndexOutOfRange is returned when the mapping destination function is passed an out of range wildcard index value for one of it's arguments
-	ErrorMappingDestinationFunctionWildcardIndexOutOfRange = fmt.Errorf("%w: wildcard index out of range", ErrInvalidMappingDestination)
+	// ErrMappingDestinationIndexOutOfRange is returned when the mapping destination function is passed an out of range wildcard index value for one of it's arguments
+	ErrMappingDestinationIndexOutOfRange = fmt.Errorf("%w: wildcard index out of range", ErrInvalidMappingDestination)
 
-	// ErrorMappingDestinationFunctionNotEnoughArguments is returned when the mapping destination function is not passed enough arguments
-	ErrorMappingDestinationFunctionNotEnoughArguments = fmt.Errorf("%w: not enough arguments passed to the function", ErrInvalidMappingDestination)
+	// ErrMappingDestinationNotEnoughArgs is returned when the mapping destination function is not passed enough arguments
+	ErrMappingDestinationNotEnoughArgs = fmt.Errorf("%w: not enough arguments passed to the function", ErrInvalidMappingDestination)
 
-	// ErrorMappingDestinationFunctionInvalidArgument is returned when the mapping destination function is passed and invalid argument
-	ErrorMappingDestinationFunctionInvalidArgument = fmt.Errorf("%w: function argument is invalid or in the wrong format", ErrInvalidMappingDestination)
+	// ErrMappingDestinationInvalidArg is returned when the mapping destination function is passed and invalid argument
+	ErrMappingDestinationInvalidArg = fmt.Errorf("%w: function argument is invalid or in the wrong format", ErrInvalidMappingDestination)
 
-	// ErrorMappingDestinationFunctionTooManyArguments is returned when the mapping destination function is passed too many arguments
-	ErrorMappingDestinationFunctionTooManyArguments = fmt.Errorf("%w: too many arguments passed to the function", ErrInvalidMappingDestination)
+	// ErrMappingDestinationTooManyArgs is returned when the mapping destination function is passed too many arguments
+	ErrMappingDestinationTooManyArgs = fmt.Errorf("%w: too many arguments passed to the function", ErrInvalidMappingDestination)
+
+	// ErrMappingDestinationNotSupportedForImport is returned when you try to use a mapping function other than wildcard in a transform that needs to be reversible (i.e. an import)
+	ErrMappingDestinationNotSupportedForImport = fmt.Errorf("%w: the only mapping function allowed for import transforms is {{Wildcard()}}", ErrInvalidMappingDestination)
 )
 
 // mappingDestinationErr is a type of subject mapping destination error
@@ -312,7 +327,7 @@ type errCtx struct {
 	ctx string
 }
 
-func NewErrorCtx(err error, format string, args ...interface{}) error {
+func NewErrorCtx(err error, format string, args ...any) error {
 	return &errCtx{err, fmt.Sprintf(format, args...)}
 }
 

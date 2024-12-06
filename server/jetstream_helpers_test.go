@@ -1,4 +1,4 @@
-// Copyright 2020-2023 The NATS Authors
+// Copyright 2020-2024 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,12 +19,17 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"math/rand"
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -37,10 +42,13 @@ import (
 func init() {
 	// Speed up raft for tests.
 	hbInterval = 50 * time.Millisecond
-	minElectionTimeout = 750 * time.Millisecond
-	maxElectionTimeout = 2500 * time.Millisecond
-	lostQuorumInterval = 500 * time.Millisecond
+	minElectionTimeout = 1500 * time.Millisecond
+	maxElectionTimeout = 3500 * time.Millisecond
+	lostQuorumInterval = 2 * time.Second
 	lostQuorumCheck = 4 * hbInterval
+
+	// For statz and jetstream placement speedups as well.
+	statszRateLimit = 0
 }
 
 // Used to setup clusters of clusters for tests.
@@ -279,6 +287,25 @@ var jsMixedModeGlobalAccountTempl = `
 `
 
 var jsGWTempl = `%s{name: %s, urls: [%s]}`
+
+var jsClusterAccountLimitsTempl = `
+	listen: 127.0.0.1:-1
+	server_name: %s
+	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+
+	cluster {
+		name: %s
+		listen: 127.0.0.1:%d
+		routes = [%s]
+	}
+
+	no_auth_user: js
+
+	accounts {
+		$JS { users = [ { user: "js", pass: "p" } ]; jetstream: {max_store: 1MB, max_mem: 0} }
+		$SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }
+	}
+`
 
 func createJetStreamTaggedSuperCluster(t *testing.T) *supercluster {
 	return createJetStreamTaggedSuperClusterWithGWProxy(t, nil)
@@ -1112,6 +1139,16 @@ func (s *Server) setJetStreamMigrateOnRemoteLeaf() {
 	s.mu.Unlock()
 }
 
+// Helper to set the remote migrate feature.
+func (s *Server) setJetStreamMigrateOnRemoteLeafWithDelay(delay time.Duration) {
+	s.mu.Lock()
+	for _, cfg := range s.leafRemoteCfgs {
+		cfg.JetStreamClusterMigrate = true
+		cfg.JetStreamClusterMigrateDelay = delay
+	}
+	s.mu.Unlock()
+}
+
 // Will add in the mapping for the account to each server.
 func (c *cluster) addSubjectMapping(account, src, dest string) {
 	c.t.Helper()
@@ -1164,13 +1201,17 @@ func jsClientConnect(t testing.TB, s *Server, opts ...nats.Option) (*nats.Conn, 
 	return nc, js
 }
 
-func jsClientConnectEx(t testing.TB, s *Server, domain string, opts ...nats.Option) (*nats.Conn, nats.JetStreamContext) {
+func jsClientConnectEx(t testing.TB, s *Server, jsOpts []nats.JSOpt, opts ...nats.Option) (*nats.Conn, nats.JetStreamContext) {
 	t.Helper()
 	nc, err := nats.Connect(s.ClientURL(), opts...)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	js, err := nc.JetStream(nats.MaxWait(10*time.Second), nats.Domain(domain))
+	jo := []nats.JSOpt{nats.MaxWait(10 * time.Second)}
+	if len(jsOpts) > 0 {
+		jo = append(jo, jsOpts...)
+	}
+	js, err := nc.JetStream(jo...)
 	if err != nil {
 		t.Fatalf("Unexpected error getting JetStream context: %v", err)
 	}
@@ -1434,10 +1475,30 @@ func (c *cluster) waitOnLeader() {
 	c.t.Fatalf("Expected a cluster leader, got none")
 }
 
+func (c *cluster) waitOnAccount(account string) {
+	c.t.Helper()
+	expires := time.Now().Add(40 * time.Second)
+	for time.Now().Before(expires) {
+		found := true
+		for _, s := range c.servers {
+			acc, err := s.fetchAccount(account)
+			found = found && err == nil && acc != nil
+		}
+		if found {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+		continue
+	}
+
+	c.t.Fatalf("Expected account %q to exist but didn't", account)
+}
+
 // Helper function to check that a cluster is formed
 func (c *cluster) waitOnClusterReady() {
 	c.t.Helper()
 	c.waitOnClusterReadyWithNumPeers(len(c.servers))
+	c.waitOnLeader()
 }
 
 func (c *cluster) waitOnClusterReadyWithNumPeers(numPeersExpected int) {
@@ -1506,11 +1567,31 @@ func (c *cluster) stopAll() {
 	for _, s := range c.servers {
 		s.Shutdown()
 	}
+	for _, s := range c.servers {
+		s.WaitForShutdown()
+	}
 }
 
 func (c *cluster) restartAll() {
 	c.t.Helper()
 	for i, s := range c.servers {
+		if !s.Running() {
+			opts := c.opts[i]
+			s, o := RunServerWithConfig(opts.ConfigFile)
+			c.servers[i] = s
+			c.opts[i] = o
+		}
+	}
+	c.waitOnClusterReady()
+}
+
+func (c *cluster) lameDuckRestartAll() {
+	c.t.Helper()
+	for _, s := range c.servers {
+		s.lameDuckMode()
+	}
+	for i, s := range c.servers {
+		s.WaitForShutdown()
 		if !s.Running() {
 			opts := c.opts[i]
 			s, o := RunServerWithConfig(opts.ConfigFile)
@@ -1555,6 +1636,36 @@ func (c *cluster) stableTotalSubs() (total int) {
 
 }
 
+func addStreamPedanticWithError(t *testing.T, nc *nats.Conn, cfg *StreamConfigRequest) (*StreamInfo, *ApiError) {
+	t.Helper()
+	req, err := json.Marshal(cfg)
+	require_NoError(t, err)
+	rmsg, err := nc.Request(fmt.Sprintf(JSApiStreamCreateT, cfg.Name), req, 5*time.Second)
+	require_NoError(t, err)
+	var resp JSApiStreamCreateResponse
+	err = json.Unmarshal(rmsg.Data, &resp)
+	require_NoError(t, err)
+	if resp.Type != JSApiStreamCreateResponseType {
+		t.Fatalf("Invalid response type %s expected %s", resp.Type, JSApiStreamCreateResponseType)
+	}
+	return resp.StreamInfo, resp.Error
+}
+
+func updateStreamPedanticWithError(t *testing.T, nc *nats.Conn, cfg *StreamConfigRequest) (*StreamInfo, *ApiError) {
+	t.Helper()
+	req, err := json.Marshal(cfg)
+	require_NoError(t, err)
+	rmsg, err := nc.Request(fmt.Sprintf(JSApiStreamUpdateT, cfg.Name), req, time.Second)
+	require_NoError(t, err)
+	var resp JSApiStreamCreateResponse
+	err = json.Unmarshal(rmsg.Data, &resp)
+	require_NoError(t, err)
+	if resp.Type != JSApiStreamUpdateResponseType {
+		t.Fatalf("Invalid response type %s expected %s", resp.Type, JSApiStreamUpdateResponseType)
+	}
+	return resp.StreamInfo, resp.Error
+}
+
 func addStream(t *testing.T, nc *nats.Conn, cfg *StreamConfig) *StreamInfo {
 	t.Helper()
 	si, err := addStreamWithError(t, nc, cfg)
@@ -1568,7 +1679,7 @@ func addStreamWithError(t *testing.T, nc *nats.Conn, cfg *StreamConfig) (*Stream
 	t.Helper()
 	req, err := json.Marshal(cfg)
 	require_NoError(t, err)
-	rmsg, err := nc.Request(fmt.Sprintf(JSApiStreamCreateT, cfg.Name), req, time.Second)
+	rmsg, err := nc.Request(fmt.Sprintf(JSApiStreamCreateT, cfg.Name), req, 5*time.Second)
 	require_NoError(t, err)
 	var resp JSApiStreamCreateResponse
 	err = json.Unmarshal(rmsg.Data, &resp)
@@ -1615,6 +1726,7 @@ func (o *consumer) setInActiveDeleteThreshold(dthresh time.Duration) error {
 
 // Net Proxy - For introducing RTT and BW constraints.
 type netProxy struct {
+	sync.RWMutex
 	listener net.Listener
 	conns    []net.Conn
 	rtt      time.Duration
@@ -1667,8 +1779,8 @@ func (np *netProxy) start() {
 				continue
 			}
 			np.conns = append(np.conns, client, server)
-			go np.loop(np.rtt, np.up, client, server)
-			go np.loop(np.rtt, np.down, server, client)
+			go np.loop(np.up, client, server)
+			go np.loop(np.down, server, client)
 		}
 	}()
 }
@@ -1681,8 +1793,7 @@ func (np *netProxy) routeURL() string {
 	return strings.Replace(np.url, "nats", "nats-route", 1)
 }
 
-func (np *netProxy) loop(rtt time.Duration, tbw int, r, w net.Conn) {
-	delay := rtt / 2
+func (np *netProxy) loop(tbw int, r, w net.Conn) {
 	const rbl = 8192
 	var buf [rbl]byte
 	ctx := context.Background()
@@ -1692,9 +1803,13 @@ func (np *netProxy) loop(rtt time.Duration, tbw int, r, w net.Conn) {
 	for {
 		n, err := r.Read(buf[:])
 		if err != nil {
+			w.Close()
 			return
 		}
 		// RTT delays
+		np.RLock()
+		delay := np.rtt / 2
+		np.RUnlock()
 		if delay > 0 {
 			time.Sleep(delay)
 		}
@@ -1702,9 +1817,16 @@ func (np *netProxy) loop(rtt time.Duration, tbw int, r, w net.Conn) {
 			return
 		}
 		if _, err = w.Write(buf[:n]); err != nil {
+			r.Close()
 			return
 		}
 	}
+}
+
+func (np *netProxy) updateRTT(rtt time.Duration) {
+	np.Lock()
+	np.rtt = rtt
+	np.Unlock()
 }
 
 func (np *netProxy) stop() {
@@ -1794,4 +1916,110 @@ func (b *bitset) String() string {
 	}
 	sb.WriteString("\n")
 	return sb.String()
+}
+
+func copyDir(t *testing.T, dst, src string) error {
+	t.Helper()
+	srcFS := os.DirFS(src)
+	return fs.WalkDir(srcFS, ".", func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		newPath := path.Join(dst, p)
+		if d.IsDir() {
+			return os.MkdirAll(newPath, defaultDirPerms)
+		}
+		r, err := srcFS.Open(p)
+		if err != nil {
+			return err
+		}
+		defer r.Close()
+
+		w, err := os.OpenFile(newPath, os.O_CREATE|os.O_WRONLY, defaultFilePerms)
+		if err != nil {
+			return err
+		}
+		defer w.Close()
+		_, err = io.Copy(w, r)
+		return err
+	})
+}
+
+func getStreamDetails(t *testing.T, c *cluster, accountName, streamName string) *StreamDetail {
+	t.Helper()
+	srv := c.streamLeader(accountName, streamName)
+	if srv == nil {
+		return nil
+	}
+	jsz, err := srv.Jsz(&JSzOptions{Accounts: true, Streams: true, Consumer: true})
+	require_NoError(t, err)
+	for _, acc := range jsz.AccountDetails {
+		if acc.Name == accountName {
+			for _, stream := range acc.Streams {
+				if stream.Name == streamName {
+					return &stream
+				}
+			}
+		}
+	}
+	t.Error("Could not find account details")
+	return nil
+}
+
+func checkState(t *testing.T, c *cluster, accountName, streamName string) error {
+	t.Helper()
+
+	leaderSrv := c.streamLeader(accountName, streamName)
+	if leaderSrv == nil {
+		return fmt.Errorf("no leader server found for stream %q", streamName)
+	}
+	streamLeader := getStreamDetails(t, c, accountName, streamName)
+	if streamLeader == nil {
+		return fmt.Errorf("no leader found for stream %q", streamName)
+	}
+	var errs []error
+	for _, srv := range c.servers {
+		if srv == leaderSrv {
+			// Skip self
+			continue
+		}
+		acc, err := srv.LookupAccount(accountName)
+		require_NoError(t, err)
+		stream, err := acc.lookupStream(streamName)
+		require_NoError(t, err)
+		state := stream.state()
+
+		if state.Msgs != streamLeader.State.Msgs {
+			err := fmt.Errorf("[%s] Leader %v has %d messages, Follower %v has %d messages",
+				streamName, leaderSrv, streamLeader.State.Msgs,
+				srv, state.Msgs,
+			)
+			errs = append(errs, err)
+		}
+		if state.FirstSeq != streamLeader.State.FirstSeq {
+			err := fmt.Errorf("[%s] Leader %v FirstSeq is %d, Follower %v is at %d",
+				streamName, leaderSrv, streamLeader.State.FirstSeq,
+				srv, state.FirstSeq,
+			)
+			errs = append(errs, err)
+		}
+		if state.LastSeq != streamLeader.State.LastSeq {
+			err := fmt.Errorf("[%s] Leader %v LastSeq is %d, Follower %v is at %d",
+				streamName, leaderSrv, streamLeader.State.LastSeq,
+				srv, state.LastSeq,
+			)
+			errs = append(errs, err)
+		}
+		if state.NumDeleted != streamLeader.State.NumDeleted {
+			err := fmt.Errorf("[%s] Leader %v NumDeleted is %d, Follower %v is at %d\nSTATE_A: %+v\nSTATE_B: %+v\n",
+				streamName, leaderSrv, streamLeader.State.NumDeleted,
+				srv, state.NumDeleted, streamLeader.State, state,
+			)
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return nil
 }

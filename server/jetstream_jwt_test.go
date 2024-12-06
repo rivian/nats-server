@@ -1,4 +1,4 @@
-// Copyright 2020-2022 The NATS Authors
+// Copyright 2020-2024 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -27,9 +27,10 @@ import (
 	"testing"
 	"time"
 
-	jwt "github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
+
+	jwt "github.com/nats-io/jwt/v2"
 )
 
 func TestJetStreamJWTLimits(t *testing.T) {
@@ -40,7 +41,7 @@ func TestJetStreamJWTLimits(t *testing.T) {
 		if msg, err := c.Request(fmt.Sprintf(accUpdateEventSubjNew, pubKey), []byte(jwt), time.Second); err != nil {
 			t.Fatal("error not expected in this test", err)
 		} else {
-			content := make(map[string]interface{})
+			content := make(map[string]any)
 			if err := json.Unmarshal(msg.Data, &content); err != nil {
 				t.Fatalf("%v", err)
 			} else if _, ok := content["data"]; !ok {
@@ -127,14 +128,14 @@ func TestJetStreamJWTLimits(t *testing.T) {
 	dir := t.TempDir()
 	conf := createConfFile(t, []byte(fmt.Sprintf(`
 		listen: 127.0.0.1:-1
-		jetstream: {max_mem_store: 10Mb, max_file_store: 10Mb}
+		jetstream: {max_mem_store: 10Mb, max_file_store: 10Mb, store_dir: "%s"}
 		operator: %s
 		resolver: {
 			type: full
 			dir: '%s'
 		}
 		system_account: %s
-    `, ojwt, dir, sysPub)))
+    `, dir, ojwt, dir, sysPub)))
 	s, opts := RunServerWithConfig(conf)
 	defer s.Shutdown()
 	port := opts.Port
@@ -172,14 +173,14 @@ func TestJetStreamJWTLimits(t *testing.T) {
 	s.Shutdown()
 	conf = createConfFile(t, []byte(fmt.Sprintf(`
 		listen: 127.0.0.1:%d
-		jetstream: {max_mem_store: 20Mb, max_file_store: 20Mb}
+		jetstream: {max_mem_store: 20Mb, max_file_store: 20Mb, store_dir: "%s"}
 		operator: %s
 		resolver: {
 			type: full
 			dir: '%s'
 		}
 		system_account: %s
-    `, port, ojwt, dir, sysPub)))
+    `, port, dir, ojwt, dir, sysPub)))
 	s, _ = RunServerWithConfig(conf)
 	defer s.Shutdown()
 	c.Flush() // force client to discover the disconnect
@@ -345,10 +346,9 @@ func TestJetStreamJWTMove(t *testing.T) {
 		require_NoError(t, err)
 
 		// Perform actual move
-		ci, err = js.UpdateStream(&nats.StreamConfig{Name: "MOVE-ME", Replicas: replicas,
+		_, err = js.UpdateStream(&nats.StreamConfig{Name: "MOVE-ME", Replicas: replicas,
 			Placement: &nats.Placement{Tags: []string{"cloud:C2-tag"}}})
 		require_NoError(t, err)
-		require_Equal(t, ci.Cluster.Name, "C1")
 
 		sc.clusterForName("C2").waitOnStreamLeader(aExpPub, "MOVE-ME")
 
@@ -422,7 +422,7 @@ func TestJetStreamJWTClusteredTiers(t *testing.T) {
 	accClaim.Limits.JetStreamTieredLimits["R1"] = jwt.JetStreamLimits{
 		DiskStorage: 1100, Consumer: 2, Streams: 2}
 	accClaim.Limits.JetStreamTieredLimits["R3"] = jwt.JetStreamLimits{
-		DiskStorage: 3300, Consumer: 1, Streams: 1}
+		DiskStorage: 1100, Consumer: 1, Streams: 1}
 	accJwt := encodeClaim(t, accClaim, aExpPub)
 	accCreds := newUser(t, accKp)
 	tmlp := `
@@ -555,7 +555,7 @@ func TestJetStreamJWTClusteredTiers(t *testing.T) {
 	require_True(t, r3.Memory == 0)
 	require_True(t, r3.Limits == JetStreamAccountLimits{
 		MaxMemory:            0,
-		MaxStore:             3300,
+		MaxStore:             1100,
 		MaxStreams:           1,
 		MaxConsumers:         1,
 		MaxAckPending:        -1,
@@ -576,7 +576,7 @@ func TestJetStreamJWTClusteredTiersChange(t *testing.T) {
 	accClaim.Limits.JetStreamTieredLimits["R1"] = jwt.JetStreamLimits{
 		DiskStorage: 1000, MemoryStorage: 0, Consumer: 1, Streams: 1}
 	accClaim.Limits.JetStreamTieredLimits["R3"] = jwt.JetStreamLimits{
-		DiskStorage: 1500, MemoryStorage: 0, Consumer: 1, Streams: 1}
+		DiskStorage: 500, MemoryStorage: 0, Consumer: 1, Streams: 1}
 	accJwt1 := encodeClaim(t, accClaim, aExpPub)
 	accCreds := newUser(t, accKp)
 	start := time.Now()
@@ -622,12 +622,11 @@ func TestJetStreamJWTClusteredTiersChange(t *testing.T) {
 
 	cfg.Replicas = 3
 	_, err = js.UpdateStream(cfg)
-	require_Error(t, err)
-	require_Equal(t, err.Error(), "nats: insufficient storage resources available")
+	require_Error(t, err, errors.New("nats: insufficient storage resources available"))
 
 	time.Sleep(time.Second - time.Since(start)) // make sure the time stamp changes
 	accClaim.Limits.JetStreamTieredLimits["R3"] = jwt.JetStreamLimits{
-		DiskStorage: 3000, MemoryStorage: 0, Consumer: 1, Streams: 1}
+		DiskStorage: 1000, MemoryStorage: 0, Consumer: 1, Streams: 1}
 	accJwt2 := encodeClaim(t, accClaim, aExpPub)
 
 	updateJwt(t, c.randomServer().ClientURL(), sysCreds, accJwt2, 3)
@@ -878,7 +877,7 @@ func TestJetStreamJWTSysAccUpdateMixedMode(t *testing.T) {
 	require_NoError(t, err)
 }
 
-func TestJetStreamExpiredAccountNotCountedTowardLimits(t *testing.T) {
+func TestJetStreamJWTExpiredAccountNotCountedTowardLimits(t *testing.T) {
 	op, _ := nkeys.CreateOperator()
 	opPk, _ := op.PublicKey()
 	sk, _ := nkeys.CreateOperator()
@@ -926,7 +925,7 @@ func TestJetStreamExpiredAccountNotCountedTowardLimits(t *testing.T) {
 	conf := createConfFile(t, []byte(fmt.Sprintf(`
 		listen: 127.0.0.1:-1
 		operator: %s
-		jetstream: {max_mem_store: 10Mb, max_file_store: 10Mb}
+		jetstream: {max_mem_store: 10Mb, max_file_store: 10Mb, store_dir: "%s"}
 		system_account: %s
 		resolver: {
 			type: full
@@ -934,7 +933,7 @@ func TestJetStreamExpiredAccountNotCountedTowardLimits(t *testing.T) {
 			dir: '%s'
 			timeout: "500ms"
 		}
-    `, opJwt, syspub, dirSrv)))
+    `, opJwt, dirSrv, syspub, dirSrv)))
 
 	s, _ := RunServerWithConfig(conf)
 	defer s.Shutdown()
@@ -974,7 +973,7 @@ func TestJetStreamExpiredAccountNotCountedTowardLimits(t *testing.T) {
 	require_True(t, ai.Limits.MaxMemory == 7*1024*1024)
 }
 
-func TestJetStreamDeletedAccountDoesNotLeakSubscriptions(t *testing.T) {
+func TestJetStreamJWTDeletedAccountDoesNotLeakSubscriptions(t *testing.T) {
 	op, _ := nkeys.CreateOperator()
 	opPk, _ := op.PublicKey()
 	sk, _ := nkeys.CreateOperator()
@@ -1094,7 +1093,7 @@ func TestJetStreamDeletedAccountDoesNotLeakSubscriptions(t *testing.T) {
 	checkNumSubs(beforeCreate + 1)
 }
 
-func TestJetStreamDeletedAccountIsReEnabled(t *testing.T) {
+func TestJetStreamJWTDeletedAccountIsReEnabled(t *testing.T) {
 	op, _ := nkeys.CreateOperator()
 	opPk, _ := op.PublicKey()
 	sk, _ := nkeys.CreateOperator()
@@ -1143,7 +1142,7 @@ func TestJetStreamDeletedAccountIsReEnabled(t *testing.T) {
 	conf := createConfFile(t, []byte(fmt.Sprintf(`
 		listen: 127.0.0.1:-1
 		operator: %s
-		jetstream: {max_mem_store: 10Mb, max_file_store: 10Mb, store_dir: %v}
+		jetstream: {max_mem_store: 10Mb, max_file_store: 10Mb, store_dir: "%s"}
 		system_account: %s
 		resolver: {
 			type: full
@@ -1263,4 +1262,380 @@ func TestJetStreamDeletedAccountIsReEnabled(t *testing.T) {
 		t.Error("Unexpected message")
 	}
 	ncA.Close()
+}
+
+// Make sure 100MB HA means 100MB of R3, not 33.3MB.
+func TestJetStreamJWTHAStorageLimitsAndAccounting(t *testing.T) {
+	sysKp, syspub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
+	newUser(t, sysKp)
+
+	maxFileStorage := int64(100 * 1024 * 1024)
+	maxMemStorage := int64(2 * 1024 * 1024)
+
+	accKp, aExpPub := createKey(t)
+	accClaim := jwt.NewAccountClaims(aExpPub)
+	accClaim.Name = "acc"
+	accClaim.Limits.JetStreamTieredLimits["R3"] = jwt.JetStreamLimits{DiskStorage: maxFileStorage, MemoryStorage: maxMemStorage}
+	accJwt := encodeClaim(t, accClaim, aExpPub)
+	accCreds := newUser(t, accKp)
+	tmlp := `
+		listen: 127.0.0.1:-1
+		server_name: %s
+		jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+		leaf { listen: 127.0.0.1:-1 }
+		cluster {
+			name: %s
+			listen: 127.0.0.1:%d
+			routes = [%s]
+		}
+	` + fmt.Sprintf(`
+		operator: %s
+		system_account: %s
+		resolver = MEMORY
+		resolver_preload = {
+			%s : %s
+			%s : %s
+		}
+	`, ojwt, syspub, syspub, sysJwt, aExpPub, accJwt)
+
+	c := createJetStreamClusterWithTemplate(t, tmlp, "cluster", 3)
+	defer c.shutdown()
+
+	nc := natsConnect(t, c.randomServer().ClientURL(), nats.UserCredentials(accCreds))
+	defer nc.Close()
+
+	js, err := nc.JetStream()
+	require_NoError(t, err)
+
+	// Test max bytes first.
+	_, err = js.AddStream(&nats.StreamConfig{Name: "TEST", Replicas: 3, MaxBytes: maxFileStorage, Subjects: []string{"foo"}})
+	require_NoError(t, err)
+
+	require_NoError(t, js.DeleteStream("TEST"))
+
+	_, err = js.AddStream(&nats.StreamConfig{Name: "TEST", Replicas: 3, Subjects: []string{"foo"}})
+	require_NoError(t, err)
+
+	// Now test actual usage.
+	// We should be able to send just over 200 of these.
+	msg := [500 * 1024]byte{}
+	for i := 0; i < 250; i++ {
+		if _, err := js.Publish("foo", msg[:]); err != nil {
+			require_Error(t, err, NewJSAccountResourcesExceededError())
+			require_True(t, i > 200)
+			break
+		}
+	}
+
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+	// Make sure we are no more then 1 msg below our max in terms of size.
+	delta := maxFileStorage - int64(si.State.Bytes)
+	require_True(t, int(delta) < len(msg))
+
+	// Now memory as well.
+	require_NoError(t, js.DeleteStream("TEST"))
+
+	// Test max bytes first.
+	_, err = js.AddStream(&nats.StreamConfig{Name: "TEST", Replicas: 3, MaxBytes: maxMemStorage, Storage: nats.MemoryStorage, Subjects: []string{"foo"}})
+	require_NoError(t, err)
+
+	require_NoError(t, js.DeleteStream("TEST"))
+
+	_, err = js.AddStream(&nats.StreamConfig{Name: "TEST", Replicas: 3, Storage: nats.MemoryStorage, Subjects: []string{"foo"}})
+	require_NoError(t, err)
+
+	// This is much smaller, so should only be able to send 4.
+	for i := 0; i < 5; i++ {
+		if _, err := js.Publish("foo", msg[:]); err != nil {
+			require_Error(t, err, NewJSAccountResourcesExceededError())
+			require_Equal(t, i, 4)
+			break
+		}
+	}
+
+	si, err = js.StreamInfo("TEST")
+	require_NoError(t, err)
+	// Make sure we are no more then 1 msg below our max in terms of size.
+	delta = maxMemStorage - int64(si.State.Bytes)
+	require_True(t, int(delta) < len(msg))
+}
+
+func TestJetStreamJWTHAStorageLimitsOnScaleAndUpdate(t *testing.T) {
+	sysKp, syspub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
+	newUser(t, sysKp)
+
+	maxFileStorage := int64(5 * 1024 * 1024)
+	maxMemStorage := int64(1 * 1024 * 1024)
+
+	accKp, aExpPub := createKey(t)
+	accClaim := jwt.NewAccountClaims(aExpPub)
+	accClaim.Name = "acc"
+	accClaim.Limits.JetStreamTieredLimits["R3"] = jwt.JetStreamLimits{DiskStorage: maxFileStorage, MemoryStorage: maxMemStorage}
+	accClaim.Limits.JetStreamTieredLimits["R1"] = jwt.JetStreamLimits{DiskStorage: maxFileStorage, MemoryStorage: maxMemStorage}
+
+	accJwt := encodeClaim(t, accClaim, aExpPub)
+	accCreds := newUser(t, accKp)
+	tmlp := `
+		listen: 127.0.0.1:-1
+		server_name: %s
+		jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+		leaf { listen: 127.0.0.1:-1 }
+		cluster {
+			name: %s
+			listen: 127.0.0.1:%d
+			routes = [%s]
+		}
+	` + fmt.Sprintf(`
+		operator: %s
+		system_account: %s
+		resolver = MEMORY
+		resolver_preload = {
+			%s : %s
+			%s : %s
+		}
+	`, ojwt, syspub, syspub, sysJwt, aExpPub, accJwt)
+
+	c := createJetStreamClusterWithTemplate(t, tmlp, "cluster", 3)
+	defer c.shutdown()
+
+	nc := natsConnect(t, c.randomServer().ClientURL(), nats.UserCredentials(accCreds))
+	defer nc.Close()
+
+	js, err := nc.JetStream()
+	require_NoError(t, err)
+
+	// Test max bytes first.
+	_, err = js.AddStream(&nats.StreamConfig{Name: "TEST", Replicas: 3, MaxBytes: maxFileStorage, Subjects: []string{"foo"}})
+	require_NoError(t, err)
+	// Now delete
+	require_NoError(t, js.DeleteStream("TEST"))
+	// Now do 5 1MB streams.
+	for i := 1; i <= 5; i++ {
+		sname := fmt.Sprintf("TEST%d", i)
+		_, err = js.AddStream(&nats.StreamConfig{Name: sname, Replicas: 3, MaxBytes: 1 * 1024 * 1024})
+		require_NoError(t, err)
+	}
+	// Should fail.
+	_, err = js.AddStream(&nats.StreamConfig{Name: "TEST6", Replicas: 3, MaxBytes: 1 * 1024 * 1024})
+	require_Error(t, err, errors.New("insufficient storage resources"))
+
+	// Update Test1 and Test2 to smaller reservations.
+	_, err = js.UpdateStream(&nats.StreamConfig{Name: "TEST1", Replicas: 3, MaxBytes: 512 * 1024})
+	require_NoError(t, err)
+	_, err = js.UpdateStream(&nats.StreamConfig{Name: "TEST2", Replicas: 3, MaxBytes: 512 * 1024})
+	require_NoError(t, err)
+	// Now make sure TEST6 succeeds.
+	_, err = js.AddStream(&nats.StreamConfig{Name: "TEST6", Replicas: 3, MaxBytes: 1 * 1024 * 1024})
+	require_NoError(t, err)
+	// Now delete the R3 version.
+	require_NoError(t, js.DeleteStream("TEST6"))
+	// Now do R1 version and then we will scale up.
+	_, err = js.AddStream(&nats.StreamConfig{Name: "TEST6", Replicas: 1, MaxBytes: 1 * 1024 * 1024})
+	require_NoError(t, err)
+	// Now make sure scale up works.
+	_, err = js.UpdateStream(&nats.StreamConfig{Name: "TEST6", Replicas: 3, MaxBytes: 1 * 1024 * 1024})
+	require_NoError(t, err)
+	// Add in a few more streams to check reserved reporting in account info.
+	_, err = js.AddStream(&nats.StreamConfig{Name: "TEST7", Replicas: 1, MaxBytes: 2 * 1024 * 1024})
+	require_NoError(t, err)
+	_, err = js.AddStream(&nats.StreamConfig{Name: "TEST8", Replicas: 1, MaxBytes: 256 * 1024, Storage: nats.MemoryStorage})
+	require_NoError(t, err)
+	_, err = js.AddStream(&nats.StreamConfig{Name: "TEST9", Replicas: 3, MaxBytes: 22 * 1024, Storage: nats.MemoryStorage})
+	require_NoError(t, err)
+
+	// Now make sure we report reserved correctly.
+	// Do this direct to server since client does not support it yet.
+	var info JSApiAccountInfoResponse
+	resp, err := nc.Request("$JS.API.INFO", nil, time.Second)
+	require_NoError(t, err)
+	require_NoError(t, json.Unmarshal(resp.Data, &info))
+	stats := info.JetStreamAccountStats
+	r1, r3 := stats.Tiers["R1"], stats.Tiers["R3"]
+
+	require_Equal(t, r1.ReservedMemory, 256*1024)   // TEST8
+	require_Equal(t, r1.ReservedStore, 2*1024*1024) // TEST7
+	require_Equal(t, r3.ReservedMemory, 22*1024)    // TEST9
+	require_Equal(t, r3.ReservedStore, 5*1024*1024) // TEST1-TEST6
+}
+
+func TestJetStreamJWTClusteredTiersR3StreamWithR1ConsumersAndAccounting(t *testing.T) {
+	sysKp, syspub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
+	newUser(t, sysKp)
+
+	accKp, aExpPub := createKey(t)
+	accClaim := jwt.NewAccountClaims(aExpPub)
+	accClaim.Name = "acc"
+	accClaim.Limits.JetStreamTieredLimits["R1"] = jwt.JetStreamLimits{
+		DiskStorage: 1100, Consumer: 10, Streams: 1}
+	accClaim.Limits.JetStreamTieredLimits["R3"] = jwt.JetStreamLimits{
+		DiskStorage: 1100, Consumer: 1, Streams: 1}
+	accJwt := encodeClaim(t, accClaim, aExpPub)
+	accCreds := newUser(t, accKp)
+	tmlp := `
+		listen: 127.0.0.1:-1
+		server_name: %s
+		jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+		leaf {
+			listen: 127.0.0.1:-1
+		}
+		cluster {
+			name: %s
+			listen: 127.0.0.1:%d
+			routes = [%s]
+		}
+	` + fmt.Sprintf(`
+		operator: %s
+		system_account: %s
+		resolver = MEMORY
+		resolver_preload = {
+			%s : %s
+			%s : %s
+		}
+	`, ojwt, syspub, syspub, sysJwt, aExpPub, accJwt)
+
+	c := createJetStreamClusterWithTemplate(t, tmlp, "cluster", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer(), nats.UserCredentials(accCreds))
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo.*"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	// Now make sure we can add in 10 R1 consumers.
+	for i := 1; i <= 10; i++ {
+		_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+			Name:      fmt.Sprintf("C-%d", i),
+			AckPolicy: nats.AckExplicitPolicy,
+			Replicas:  1,
+		})
+		require_NoError(t, err)
+	}
+
+	info, err := js.AccountInfo()
+	require_NoError(t, err)
+
+	// Make sure we account for these properly.
+	r1 := info.Tiers["R1"]
+	r3 := info.Tiers["R3"]
+
+	require_Equal(t, r1.Streams, 0)
+	require_Equal(t, r1.Consumers, 10)
+	require_Equal(t, r3.Streams, 1)
+	require_Equal(t, r3.Consumers, 0)
+}
+
+func TestJetStreamJWTClusterAccountNRG(t *testing.T) {
+	_, syspub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
+
+	_, aExpPub := createKey(t)
+	accClaim := jwt.NewAccountClaims(aExpPub)
+	accClaim.Name = "acc"
+	accClaim.Limits.JetStreamTieredLimits["R1"] = jwt.JetStreamLimits{DiskStorage: 1100, Consumer: 10, Streams: 1}
+	accClaim.Limits.JetStreamTieredLimits["R3"] = jwt.JetStreamLimits{DiskStorage: 1100, Consumer: 1, Streams: 1}
+	accJwt := encodeClaim(t, accClaim, aExpPub)
+
+	_, aExpPub2 := createKey(t)
+	accClaim2 := jwt.NewAccountClaims(aExpPub2)
+	accClaim2.Name = "another_acc"
+	accJwt2 := encodeClaim(t, accClaim2, aExpPub2)
+
+	tmlp := `
+		listen: 127.0.0.1:-1
+		server_name: %s
+		jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+		leaf {
+			listen: 127.0.0.1:-1
+		}
+		cluster {
+			name: %s
+			listen: 127.0.0.1:%d
+			routes = [%s]
+		}
+	` + fmt.Sprintf(`
+		operator: %s
+		system_account: %s
+		resolver = MEMORY
+		resolver_preload = {
+			%s : %s
+			%s : %s
+			%s : %s
+		}
+	`, ojwt, syspub, syspub, sysJwt, aExpPub, accJwt, aExpPub2, accJwt2)
+
+	c := createJetStreamClusterWithTemplate(t, tmlp, "cluster", 3)
+	defer c.shutdown()
+
+	// We'll try flipping the state a few times and then do some sanity
+	// checks to check that it took effect.
+	thirdAcc := jwt.ClusterTraffic(fmt.Sprintf("account:%s", aExpPub2))
+	// TODO: Not currently testing thirdAcc because we haven't enabled this
+	// functionality yet. If/when we do enable, this test is ready just by
+	// uncommenting the third state below.
+	for _, state := range []jwt.ClusterTraffic{"system", "owner" /*, thirdAcc */} {
+		accClaim.ClusterTraffic = state
+		accJwt = encodeClaim(t, accClaim, aExpPub)
+
+		for _, s := range c.servers {
+			// Update the account claim for our "third account".
+			acc, err := s.lookupAccount(aExpPub2)
+			require_NoError(t, err)
+			require_NoError(t, s.updateAccountWithClaimJWT(acc, accJwt2))
+
+			// Then update the account claim for the asset account.
+			acc, err = s.lookupAccount(aExpPub)
+			require_NoError(t, err)
+			require_NoError(t, s.updateAccountWithClaimJWT(acc, accJwt))
+
+			// Check that everything looks like it should.
+			require_True(t, acc != nil)
+			require_True(t, acc.js != nil)
+			switch state {
+			case "system":
+				require_Equal(t, acc.js.nrgAccount, _EMPTY_)
+			case "owner":
+				require_Equal(t, acc.js.nrgAccount, aExpPub)
+			case thirdAcc:
+				require_Equal(t, acc.js.nrgAccount, aExpPub2)
+			}
+
+			// Now get a list of all of the Raft nodes that should
+			// have been updated by now.
+			s.rnMu.Lock()
+			raftNodes := make([]*raft, 0, len(s.raftNodes))
+			for _, n := range s.raftNodes {
+				rg := n.(*raft)
+				if rg.accName != acc.Name {
+					continue
+				}
+				raftNodes = append(raftNodes, rg)
+			}
+			s.rnMu.Unlock()
+
+			// Check whether each of the Raft nodes reports being
+			// in-account or not.
+			for _, rg := range raftNodes {
+				rg.Lock()
+				rgAcc := rg.acc
+				rg.Unlock()
+				switch state {
+				case "system":
+					require_Equal(t, rgAcc.Name, syspub)
+				case "owner":
+					require_Equal(t, rgAcc.Name, aExpPub)
+				case thirdAcc:
+					require_Equal(t, rgAcc.Name, aExpPub2)
+				}
+			}
+		}
+	}
 }

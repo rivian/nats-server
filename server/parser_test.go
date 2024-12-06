@@ -1,4 +1,4 @@
-// Copyright 2012-2020 The NATS Authors
+// Copyright 2012-2024 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -424,7 +424,7 @@ func TestParseHeaderPubArg(t *testing.T) {
 		{arg: "\t \tfoo\t \t \t\t\t11\t\t 2222\t \t", subject: "foo", reply: "", hdr: 11, size: 2222, szb: "2222"},
 	} {
 		t.Run(test.arg, func(t *testing.T) {
-			if err := c.processHeaderPub([]byte(test.arg)); err != nil {
+			if err := c.processHeaderPub([]byte(test.arg), nil); err != nil {
 				t.Fatalf("Unexpected parse error: %v\n", err)
 			}
 			if !bytes.Equal(c.pa.subject, []byte(test.subject)) {
@@ -448,6 +448,7 @@ func TestParseHeaderPubArg(t *testing.T) {
 
 func TestParseRoutedHeaderMsg(t *testing.T) {
 	c := dummyRouteClient()
+	c.route = &route{}
 
 	pub := []byte("HMSG $foo foo 10 8\r\nXXXhello\r")
 	if err := c.parse(pub); err == nil {
@@ -565,6 +566,7 @@ func TestParseRoutedHeaderMsg(t *testing.T) {
 
 func TestParseRouteMsg(t *testing.T) {
 	c := dummyRouteClient()
+	c.route = &route{}
 
 	pub := []byte("MSG $foo foo 5\r\nhello\r")
 	err := c.parse(pub)
@@ -829,7 +831,10 @@ func TestMaxControlLine(t *testing.T) {
 				c.setNoReconnect()
 				c.flags.set(connectReceived)
 				c.kind = test.kind
-				if test.kind == GATEWAY {
+				switch test.kind {
+				case ROUTER:
+					c.route = &route{}
+				case GATEWAY:
 					c.gw = &gateway{outbound: false, connected: true, insim: make(map[string]*insie)}
 				}
 				c.mcl = 8

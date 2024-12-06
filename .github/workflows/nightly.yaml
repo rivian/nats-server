@@ -1,4 +1,4 @@
-name: "NATS Server Nightly: DEV"
+name: Docker Nightly
 on:
   workflow_dispatch:
     inputs:
@@ -11,18 +11,18 @@ on:
     - cron: "40 4 * * *"
 
 jobs:
-  nightly_release:
+  run:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           path: src/github.com/nats-io/nats-server
-          ref: ${{ inputs.target || 'dev' }}
+          ref: ${{ inputs.target || 'main' }}
 
       - uses: ./src/github.com/nats-io/nats-server/.github/actions/nightly-release
         with:
-          go: "1.19"
+          go: "1.23"
           workdir: src/github.com/nats-io/nats-server
           label: nightly
           hub_username: "${{ secrets.DOCKER_USERNAME }}"

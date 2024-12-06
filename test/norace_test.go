@@ -1,4 +1,4 @@
-// Copyright 2019-2020 The NATS Authors
+// Copyright 2019-2024 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -18,9 +18,9 @@ package test
 
 import (
 	"context"
+	crand "crypto/rand"
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"net"
 	"net/url"
 	"os"
@@ -46,6 +46,8 @@ func TestNoRaceRouteSendSubs(t *testing.T) {
 			write_deadline: "2s"
 			cluster {
 				port: -1
+				pool_size: -1
+				compression: disabled
 				%s
 			}
 			no_sys_acc: true
@@ -94,7 +96,7 @@ func TestNoRaceRouteSendSubs(t *testing.T) {
 	clientBExpect(pongRe)
 
 	if err := checkExpectedSubs(totalPerServer, srvA, srvB); err != nil {
-		t.Fatalf(err.Error())
+		t.Fatal(err.Error())
 	}
 
 	routes := fmt.Sprintf(`
@@ -111,7 +113,7 @@ func TestNoRaceRouteSendSubs(t *testing.T) {
 
 	checkClusterFormed(t, srvA, srvB)
 	if err := checkExpectedSubs(2*totalPerServer, srvA, srvB); err != nil {
-		t.Fatalf(err.Error())
+		t.Fatal(err.Error())
 	}
 
 	checkSlowConsumers := func(t *testing.T) {
@@ -164,7 +166,7 @@ func TestNoRaceRouteSendSubs(t *testing.T) {
 	defer requestorOnB.Close()
 
 	if err := checkExpectedSubs(2*totalPerServer+2, srvA, srvB); err != nil {
-		t.Fatalf(err.Error())
+		t.Fatal(err.Error())
 	}
 
 	totalReplies := 120000
@@ -685,7 +687,7 @@ func TestNoRaceSlowProxy(t *testing.T) {
 	// Now test send BW.
 	const payloadSize = 64 * 1024
 	var payload [payloadSize]byte
-	rand.Read(payload[:])
+	crand.Read(payload[:])
 
 	// 5MB total.
 	bytesSent := (5 * 1024 * 1024)
